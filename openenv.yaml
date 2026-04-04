@@ -1,0 +1,11 @@
+name: "Cloud-SRE-Gym"
+version: "1.0.0"
+description: "A tool-based POMDP environment for autonomous cloud resource optimization."
+entrypoint: "src.env:CloudSREEnv"
+tasks:
+  - id: "easy-traffic"
+    kwargs: { difficulty: "easy" }
+  - id: "medium-spikes"
+    kwargs: { difficulty: "medium" }
+  - id: "hard-incidents"
+    kwargs: { difficulty: "hard" }
