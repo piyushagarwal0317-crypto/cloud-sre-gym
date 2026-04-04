@@ -1,6 +1,12 @@
-Here is the revised `README.md` with the Mermaid diagram removed. I replaced the graph in the **System Architecture** section with a clear, text-based workflow description so the architectural flow remains easy to understand\!
-
------
+---
+title: Cloud SRE Gym
+emoji: ☁️
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+app_port: 8000
+---
 
 # ☁️ Cloud SRE Gym: OpenEnv for Autonomous Cloud Resource Optimization
 
