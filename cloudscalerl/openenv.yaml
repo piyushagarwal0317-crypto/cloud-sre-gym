@@ -1,7 +1,83 @@
-spec_version: 1
 name: cloudscalerl
-type: space
-runtime: fastapi
-app: server.app:app
-port: 8000
+version: 0.1.0
+description: >
+  Kubernetes-inspired autoscaling RL environment. Agent manages HPA, VPA,
+  and multi-region traffic routing under realistic workload traces.
+  LLM-powered reasoning agent observes live cluster metrics and outputs
+  structured scaling actions every 60-second simulated tick.
 
+tasks:
+  - id: task1_hpa
+    name: "Reactive HPA"
+    difficulty: easy
+    max_steps: 480
+    description: >
+      Single service (api-gateway), single region, predictable diurnal traffic.
+      CPU spikes to 85% at ticks 60, 240, 420. Keep p99 < 200ms throughout.
+    grader: cloudscalerl.server.tasks.task1_hpa:grade_task1
+    metadata:
+      services: ["api-gateway"]
+      regions: ["us-east-1"]
+      budget_usd_per_hr: 50.0
+
+  - id: task2_cost
+    name: "Cost-Aware Multi-Service"
+    difficulty: medium
+    max_steps: 720
+    description: >
+      4 services (frontend, api, worker, db-proxy), 2 regions. Budget cap $15/hr.
+      Weekly traffic pattern with embedded flash-sale spike. Maintain SLO and cost.
+    grader: cloudscalerl.server.tasks.task2_cost:grade_task2
+    metadata:
+      services: ["frontend", "api", "worker", "db-proxy"]
+      regions: ["us-east-1", "eu-west-1"]
+      budget_usd_per_hr: 15.0
+
+  - id: task3_incident
+    name: "Multi-Region Incident Response"
+    difficulty: hard
+    max_steps: 300
+    description: >
+      3 regions. AZ degradation (50% packet loss) in us-east-1 at tick 30.
+      Agent must failover traffic, scale VPA in healthy regions, maintain global SLO.
+    grader: cloudscalerl.server.tasks.task3_incident:grade_task3
+    metadata:
+      services: ["api-gateway", "worker", "db-proxy"]
+      regions: ["us-east-1", "eu-west-1", "ap-south-1"]
+      budget_usd_per_hr: 20.0
+      incident_tick: 30
+      incident_region: "us-east-1"
+
+action_space: discrete_continuous_hybrid
+observation_space: vector
+reward_range: [-1.0, 1.0]
+
+reward_components:
+  - name: slo_score
+    weight: 0.4
+    description: "Fraction of services with p99 < 200ms AND error_rate < 0.1%"
+  - name: cost_efficiency
+    weight: 0.3
+    description: "1 - (actual_cost / oracle_optimal_cost)"
+  - name: stability
+    weight: 0.2
+    description: "Penalty for replica thrashing (>50% change in 3 ticks)"
+  - name: penalty
+    weight: -0.3
+    description: "Budget overflow, invalid region weights, below min replicas"
+
+timing:
+  tick_duration_seconds: 60
+  pod_scheduling_ticks: 2
+  node_provisioning_ticks: 5
+  pod_startup_latency_seconds_mean: 45
+  pod_startup_latency_seconds_std: 10
+
+features:
+  carbon_intensity: true
+  spot_instance_preemption: true
+  pending_events: true
+  pod_disruption_budget: true
+  counterfactual_oracle: true
+
+tags: [cloud, kubernetes, autoscaling, infrastructure, sre, llm, multi-region]

@@ -1,84 +1,117 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
 """
-FastAPI application for the Cloudscalerl Environment.
-
-This module creates an HTTP server that exposes the CloudscalerlEnvironment
-over HTTP and WebSocket endpoints, compatible with EnvClient.
-
-Endpoints:
-    - POST /reset: Reset the environment
-    - POST /step: Execute an action
-    - GET /state: Get current environment state
-    - GET /schema: Get action/observation schemas
-    - WS /ws: WebSocket endpoint for persistent sessions
-
-Usage:
-    # Development (with auto-reload):
-    uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
-
-    # Production:
-    uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 4
-
-    # Or run directly:
-    python -m server.app
+CloudScaleRL FastAPI Server
+=============================
+Exposes the RL environment over HTTP so the LLM agent (client.py)
+can interact with it via POST /reset, POST /step, GET /state, GET /render.
 """
 
-try:
-    from openenv.core.env_server.http_server import create_app
-except Exception as e:  # pragma: no cover
-    raise ImportError(
-        "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
-    ) from e
+from __future__ import annotations
 
-try:
-    from ..models import CloudscalerlAction, CloudscalerlObservation
-    from .cloudscalerl_environment import CloudscalerlEnvironment
-except ModuleNotFoundError:
-    from models import CloudscalerlAction, CloudscalerlObservation
-    from server.cloudscalerl_environment import CloudscalerlEnvironment
+import json
+from pathlib import Path
+from typing import Any, Optional
 
+import yaml
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# Create the app with web interface and README integration
-app = create_app(
-    CloudscalerlEnvironment,
-    CloudscalerlAction,
-    CloudscalerlObservation,
-    env_name="cloudscalerl",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+from cloudscalerl.models import Action, Observation, Reward
+from server.cloudscalerl_environment import CloudScaleEnvironment
+
+# Load task configs from openenv.yaml
+_OPENENV_PATH = Path(__file__).parent.parent / "openenv.yaml"
+with open(_OPENENV_PATH) as f:
+    _OPENENV = yaml.safe_load(f)
+
+TASK_CONFIGS: dict[str, dict[str, Any]] = {
+    t["id"]: t for t in _OPENENV["tasks"]
+}
+
+app = FastAPI(
+    title="CloudScaleRL",
+    description="Kubernetes-inspired cloud autoscaling RL environment",
+    version="0.1.0",
 )
 
-
-def main(host: str = "0.0.0.0", port: int = 8000):
-    """
-    Entry point for direct execution via uv run or python -m.
-
-    This function enables running the server without Docker:
-        uv run --project . server
-        uv run --project . server --port 8001
-        python -m cloudscalerl.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
-
-    For production deployments, consider using uvicorn directly with
-    multiple workers:
-        uvicorn cloudscalerl.server.app:app --workers 4
-    """
-    import uvicorn
-
-    uvicorn.run(app, host=host, port=port)
+# One active environment instance per server process (single-agent use)
+_env: Optional[CloudScaleEnvironment] = None
 
 
-if __name__ == "__main__":
-    import argparse
+# ── Request / Response Models ─────────────────────────────────────────────────
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+
+class ResetRequest(BaseModel):
+    task_id: str
+    seed: int = 42
+
+
+class StepResponse(BaseModel):
+    observation: dict[str, Any]
+    reward: dict[str, Any]
+    done: bool
+    info: dict[str, Any]
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+
+@app.post("/reset", response_model=dict[str, Any])
+def reset(req: ResetRequest) -> dict[str, Any]:
+    """Reset the environment for a new episode."""
+    global _env
+
+    if req.task_id not in TASK_CONFIGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown task_id '{req.task_id}'. Valid: {list(TASK_CONFIGS.keys())}",
+        )
+
+    config = TASK_CONFIGS[req.task_id]
+    _env = CloudScaleEnvironment(task_config=config, seed=req.seed)
+    obs = _env.reset()
+    return obs.model_dump()
+
+
+@app.post("/step", response_model=StepResponse)
+def step(action: Action) -> StepResponse:
+    """Advance the environment one tick with the given action."""
+    if _env is None:
+        raise HTTPException(status_code=400, detail="Environment not initialised. Call /reset first.")
+
+    obs, reward, done, info = _env.step(action)
+
+    return StepResponse(
+        observation=obs.model_dump(),
+        reward=reward.model_dump(),
+        done=done,
+        info=info,
+    )
+
+
+@app.get("/state", response_model=dict[str, Any])
+def get_state() -> dict[str, Any]:
+    """Get current environment state without advancing."""
+    if _env is None:
+        raise HTTPException(status_code=400, detail="Environment not initialised. Call /reset first.")
+    obs = _env._build_observation()
+    return obs.model_dump()
+
+
+@app.get("/render", response_model=dict[str, Any])
+def render() -> dict[str, Any]:
+    """JSON dashboard snapshot — human-readable cluster state for debugging."""
+    if _env is None:
+        raise HTTPException(status_code=400, detail="Environment not initialised. Call /reset first.")
+    return _env.render()
+
+
+@app.get("/tasks", response_model=list[dict[str, Any]])
+def list_tasks() -> list[dict[str, Any]]:
+    """List all available tasks with metadata."""
+    return list(TASK_CONFIGS.values())
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "version": "0.1.0"}

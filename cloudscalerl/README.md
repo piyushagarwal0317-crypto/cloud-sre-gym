@@ -10,9 +10,7 @@ Resource Bin-Packing: Balancing HPA (Replicas) and VPA (Pod Size).
 
 Green Routing: Shifting traffic to regions with the lowest carbon intensity.
 
-🏗️ Technical Architecture
-Folder Structure
-Plaintext
+```text
 cloudscalerl/
 ├── client.py           # LLM Reasoning Agent (OpenAI GPT-4o)
 ├── models.py           # Pydantic Schemas (Observation, Action, Reward)
@@ -29,9 +27,7 @@ L
 p99
 ​
  =L 
-base
-​
- +( 
+base+( 
 Capacity
 RPS
 ​
