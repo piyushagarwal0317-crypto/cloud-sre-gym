@@ -28,9 +28,9 @@ $$L_{p99} = L_{base} + \left(\frac{RPS}{Capacity}\right)^4$$
 ## 🎮 Tasks & Graders (25%)
 | Task ID | Difficulty | Objective | Grader Criteria (0.0–1.0) |
 |---|---|---|---|
-| task1_steady | Easy | Maintain SLO during diurnal cycle | 1.0 if Uptime > 99.9% |
-| task2_burst | Medium | Handle 10x Flash Sale spike | Weighted: 60% SLO + 40% Budget |
-| task3_chaos | Hard | Regional Outage + Carbon Optimization | 50% Recovery Speed + 50% Carbon Save |
+| task1_hpa | Easy | Maintain SLO during diurnal cycle | Fraction of ticks with SLO met |
+| task2_cost | Medium | Handle flash-sale traffic under budget | 60% SLO + 40% budget compliance |
+| task3_incident | Hard | Multi-region failover and recovery | 50% availability + 30% recovery + 20% cost |
 ## 📊 Baseline Statistics & Results
 Note to Judges: These results were generated using the provided client.py baseline script against the gpt-4o model.
 ### Performance Comparison
@@ -62,8 +62,32 @@ docker run -p 8000:8000 cloudscalerl
 ### Running the Agent
 ```bash
 export OPENAI_API_KEY='your_key_here'
-python client.py --task task2_burst
+python -m cloudscalerl.client task2_cost
 ```
+
+### Running with Ollama (Fine-Tuned Local Model)
+```bash
+# 1) Build your local model from Modelfile
+ollama create cloudscalerl-sre -f Modelfile
+
+# 2) Start environment server
+python -m uvicorn cloudscalerl.server.app:app --host 127.0.0.1 --port 8000
+```
+
+```bash
+# 3) Run agent against Ollama OpenAI-compatible endpoint
+export ENV_URL='http://127.0.0.1:8000'
+export USE_OLLAMA='true'
+export OLLAMA_BASE_URL='http://127.0.0.1:11434'
+export AGENT_MODEL='sre-agent'
+export USE_TOOLS='false'
+python -m cloudscalerl.client task1_hpa
+```
+
+Notes:
+- If your Ollama model does not support strict JSON response mode, set `FORCE_JSON_RESPONSE_FORMAT=false`.
+- If you prefer, set `OLLAMA_MODEL=sre-agent` and skip `AGENT_MODEL`.
+- You can run multiple tasks in one command, e.g. `python -m cloudscalerl.client task1_hpa task2_cost task3_incident`.
 ### Spec Validation
 ```bash
 openenv validate http://localhost:8000

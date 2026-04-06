@@ -50,8 +50,9 @@ from cloudscalerl.models import (
 TRACES_DIR = Path(__file__).parent / "workload_traces"
 
 TICK_DURATION_S = 60
-POD_SCHEDULING_TICKS = 0 # Curriculum Learning: Start with 0 delays to help the agent learn basics
-NODE_PROVISIONING_TICKS = 0 # Curriculum Learning: Start with 0 delays 
+# Default to realistic delays, but allow curriculum overrides via env vars.
+POD_SCHEDULING_TICKS = int(os.environ.get("POD_SCHEDULING_TICKS", "2"))
+NODE_PROVISIONING_TICKS = int(os.environ.get("NODE_PROVISIONING_TICKS", "5"))
 POD_STARTUP_MEAN_S = 45
 POD_STARTUP_STD_S = 10
 
@@ -547,14 +548,16 @@ class CloudScaleEnvServer(EnvServer):
         load_mult = self._trace[tick_idx]
 
         for name, svc in self._services.items():
-            # Effective capacity scales with replica count and per-pod CPU request
+            # Effective capacity scales with replica count and per-pod CPU request.
+            # Service demand is traffic-driven and should not rise with replica count.
             capacity_factor = svc.replicas * (svc.cpu_request_millicores / 500.0)
-            demand = load_mult * 2.0 * svc.replicas
+            demand_rps = load_mult * 200.0
+            cpu_demand_units = load_mult * 4.0
 
             # CPU utilisation
             cpu_util = min(
                 0.99,
-                (load_mult * 0.6) / max(capacity_factor / max(svc.replicas, 1), 0.01),
+                cpu_demand_units / max(capacity_factor * 4.0, 0.01),
             )
             cpu_util = max(0.0, min(0.99, cpu_util + self._rng.gauss(0, 0.02)))
 
@@ -583,7 +586,7 @@ class CloudScaleEnvServer(EnvServer):
                 replicas=svc.replicas,
                 cpu_utilization=round(cpu_util, 4),
                 memory_utilization=round(mem_util, 4),
-                requests_per_second=round(demand, 1),
+                requests_per_second=round(demand_rps, 1),
                 p99_latency_ms=round(p99, 1),
                 error_rate=round(error_rate, 6),
                 cpu_request_millicores=svc.cpu_request_millicores,
@@ -624,15 +627,18 @@ class CloudScaleEnvServer(EnvServer):
     def _compute_slo_score(self) -> float:
         if not self._metrics_cache:
             return 0.5
-            
+
         ok = 0
+        breaches = 0
         for m in self._metrics_cache.values():
             if m.p99_latency_ms >= 200 or m.error_rate >= 0.001:
-                # Massively penalize a single SLO violation, breaking the "Do Nothing" trap
-                return -5.0
-            ok += 1
-            
-        return ok / len(self._metrics_cache)
+                breaches += 1
+            else:
+                ok += 1
+
+        total = len(self._metrics_cache)
+        # Normalized range [-1, 1]: +1 all services healthy, -1 all breached.
+        return max(-1.0, min(1.0, (ok - breaches) / total))
 
     def _compute_cost_efficiency(self) -> float:
         actual = self._current_cost_per_hour()

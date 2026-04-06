@@ -93,8 +93,8 @@ def get_state() -> dict[str, Any]:
     """Get current environment state without advancing."""
     if _env is None:
         raise HTTPException(status_code=400, detail="Environment not initialised. Call /reset first.")
-    obs = _env._build_observation()
-    return obs.model_dump()
+    state = _env._get_state()
+    return state.model_dump()
 
 
 @app.get("/render", response_model=dict[str, Any])

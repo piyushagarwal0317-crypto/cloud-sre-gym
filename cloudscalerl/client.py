@@ -27,6 +27,7 @@ import sys
 import time
 from typing import Any, Optional
 
+import httpx
 from openai import OpenAI
 from pydantic import ValidationError
 from rich.console import Console
@@ -71,12 +72,45 @@ from cloudscalerl.models import (
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 console = Console()
+
+
+def _resolve_base_url() -> Optional[str]:
+    explicit = os.environ.get("OPENAI_BASE_URL")
+    if explicit:
+        return explicit
+
+    if os.environ.get("USE_OLLAMA", "false").lower() == "true":
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        return ollama_url.rstrip("/") + "/v1"
+
+    return None
+
+
+_resolved_base_url = _resolve_base_url()
+_resolved_api_key = os.environ.get("OPENAI_API_KEY")
+if not _resolved_api_key and _resolved_base_url and "11434" in _resolved_base_url:
+    _resolved_api_key = "ollama"
+
+
+def _resolve_default_model() -> str:
+    explicit = os.environ.get("AGENT_MODEL")
+    if explicit:
+        return explicit
+
+    if os.environ.get("USE_OLLAMA", "false").lower() == "true":
+        return os.environ.get("OLLAMA_MODEL", "sre-agent")
+
+    return "gpt-4o"
+
 openai_client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY", "dummy_key_for_local_testing"),
-    base_url=os.environ.get("OPENAI_BASE_URL") # Allows pointing to vLLM, Ollama, HuggingFace, etc.
+    api_key=_resolved_api_key or "dummy_key_for_local_testing",
+    base_url=_resolved_base_url,  # Allows pointing to vLLM, Ollama, HuggingFace, etc.
 )
 USE_TOOLS = os.environ.get("USE_TOOLS", "false").lower() == "true"
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "gpt-4o")
+FORCE_JSON_RESPONSE_FORMAT = (
+    os.environ.get("FORCE_JSON_RESPONSE_FORMAT", "true").lower() == "true"
+)
+DEFAULT_MODEL = _resolve_default_model()
 COMPRESS_MODEL = "gpt-4o-mini"
 ENABLE_INTERNAL_FEEDBACK = os.environ.get("ENABLE_INTERNAL_FEEDBACK", "false").lower() == "true"
 FEEDBACK_MODEL = os.environ.get("FEEDBACK_MODEL", "tinyllama-sre-critic")
@@ -333,6 +367,68 @@ class CloudScaleEnv(EnvClient):
                         self._proc.kill()
 
         return cls(base_url=base_url, provider=_DirectProvider(server_process))
+
+
+class CloudScaleHTTPEndpoint:
+    """
+    Thin HTTP client for the current FastAPI app contract.
+
+    The local app exposes REST endpoints (/reset, /step, /state) rather than
+    openenv websocket endpoints, so run_episode uses this adapter.
+    """
+
+    def __init__(self, base_url: str, timeout_s: float = 30.0) -> None:
+        self._client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_s)
+
+    def __enter__(self) -> "CloudScaleHTTPEndpoint":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._client.close()
+
+    def reset(
+        self,
+        task_id: Optional[str] = None,
+        seed: Optional[int] = None,
+        render: bool = False,
+        **kwargs: Any,
+    ) -> StepResult[CloudScaleObservation]:
+        payload: dict[str, Any] = {
+            "task_id": task_id or "task1_hpa",
+            "seed": seed or 42,
+        }
+        if render:
+            payload["render"] = True
+        payload.update(kwargs)
+
+        response = self._client.post("/reset", json=payload)
+        response.raise_for_status()
+        observation = CloudScaleObservation(**response.json())
+        return StepResult(observation=observation, reward=None, done=False)
+
+    def step(
+        self,
+        action: CloudScaleAction,
+        render: bool = False,
+        **kwargs: Any,
+    ) -> StepResult[CloudScaleObservation]:
+        payload = action.model_dump(exclude_none=True)
+        if render:
+            payload["render"] = True
+        payload.update(kwargs)
+
+        response = self._client.post("/step", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        observation = CloudScaleObservation(**data.get("observation", {}))
+        return StepResult(
+            observation=observation,
+            reward=data.get("reward"),
+            done=bool(data.get("done", False)),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -727,7 +823,7 @@ def run_episode(
         f"Task: [yellow]{task_id}[/yellow]  Model: {model}  Tools: {USE_TOOLS}"
     ))
 
-    with CloudScaleEnv(base_url=env_url) as env:
+    with CloudScaleHTTPEndpoint(base_url=env_url) as env:
         result = env.reset(task_id=task_id)
         obs: CloudScaleObservation = result.observation
 
@@ -757,12 +853,17 @@ def run_episode(
                     else CloudScaleAction(no_op=True)
                 )
             else:
+                completion_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": 512,
+                    "temperature": 0.15,
+                }
+                if FORCE_JSON_RESPONSE_FORMAT:
+                    completion_kwargs["response_format"] = {"type": "json_object"}
+
                 completion = openai_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=512,
-                    temperature=0.15,
-                    response_format={"type": "json_object"},
+                    **completion_kwargs,
                 )
                 raw = completion.choices[0].message.content or "{}"
                 action = parse_action_from_json(raw)

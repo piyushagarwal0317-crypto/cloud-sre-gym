@@ -6,7 +6,6 @@
 
 """Cloudscalerl Environment."""
 
-from .client import CloudScaleEnv
 from .models import CloudScaleAction, CloudScaleObservation
 
 __all__ = [
@@ -14,3 +13,11 @@ __all__ = [
     "CloudScaleObservation",
     "CloudScaleEnv",
 ]
+
+
+def __getattr__(name: str):
+    if name == "CloudScaleEnv":
+        from .client import CloudScaleEnv
+
+        return CloudScaleEnv
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

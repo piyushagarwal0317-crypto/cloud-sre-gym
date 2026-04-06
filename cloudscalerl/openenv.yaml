@@ -14,7 +14,7 @@ tasks:
     description: >
       Single service (api-gateway), single region, predictable diurnal traffic.
       CPU spikes to 85% at ticks 60, 240, 420. Keep p99 < 200ms throughout.
-    grader: cloudscalerl.server.tasks.task1_hpa:grade_task1
+    grader: cloudscalerl.tasks.Task1hpa:grade_task1
     metadata:
       services: ["api-gateway"]
       regions: ["us-east-1"]
@@ -27,7 +27,7 @@ tasks:
     description: >
       4 services (frontend, api, worker, db-proxy), 2 regions. Budget cap $15/hr.
       Weekly traffic pattern with embedded flash-sale spike. Maintain SLO and cost.
-    grader: cloudscalerl.server.tasks.task2_cost:grade_task2
+    grader: cloudscalerl.tasks.Task2cost:grade_task2
     metadata:
       services: ["frontend", "api", "worker", "db-proxy"]
       regions: ["us-east-1", "eu-west-1"]
@@ -40,7 +40,7 @@ tasks:
     description: >
       3 regions. AZ degradation (50% packet loss) in us-east-1 at tick 30.
       Agent must failover traffic, scale VPA in healthy regions, maintain global SLO.
-    grader: cloudscalerl.server.tasks.task3_incident:grade_task3
+    grader: cloudscalerl.tasks.Task3incident:grade_task3
     metadata:
       services: ["api-gateway", "worker", "db-proxy"]
       regions: ["us-east-1", "eu-west-1", "ap-south-1"]
