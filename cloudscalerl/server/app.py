@@ -48,7 +48,7 @@ class ResetRequest(BaseModel):
 
 class StepResponse(BaseModel):
     observation: dict[str, Any]
-    reward: dict[str, Any]
+    reward: float
     done: bool
     info: dict[str, Any]
 
@@ -82,7 +82,7 @@ def step(action: CloudScaleAction) -> StepResponse:
 
     return StepResponse(
         observation=obs.model_dump(),
-        reward=reward.model_dump(),
+        reward=reward,
         done=done,
         info=info,
     )
