@@ -78,6 +78,34 @@ openai_client = OpenAI(
 USE_TOOLS = os.environ.get("USE_TOOLS", "false").lower() == "true"
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "gpt-4o")
 COMPRESS_MODEL = "gpt-4o-mini"
+ENABLE_INTERNAL_FEEDBACK = os.environ.get("ENABLE_INTERNAL_FEEDBACK", "false").lower() == "true"
+FEEDBACK_MODEL = os.environ.get("FEEDBACK_MODEL", "tinyllama-sre-critic")
+FEEDBACK_TEMPERATURE = float(os.environ.get("FEEDBACK_TEMPERATURE", "0.0"))
+FEEDBACK_MAX_TOKENS = int(os.environ.get("FEEDBACK_MAX_TOKENS", "300"))
+
+FEEDBACK_SYSTEM_PROMPT = """
+You are an internal SRE action critic for CloudScaleRL.
+You will receive:
+- current cluster observation summary
+- the agent's proposed action
+- recent reward trend
+
+Your job is to either approve the action or provide a safer/better revised action.
+
+Return ONLY valid JSON with this schema:
+{
+    "accept": true|false,
+    "reason": "short reason",
+    "revised_action": {CloudScaleAction JSON} | null
+}
+
+Rules:
+- If action risks SLO breach (p99>=200ms or error_rate>=0.001), reject and revise.
+- If a region is DEGRADED and traffic remains there, reject and revise.
+- Avoid aggressive replica thrashing (>50% change repeatedly).
+- Prefer no_op when pending_replicas already indicates scaling is in flight.
+- revised_action must be valid for the CloudScaleAction schema.
+""".strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -602,6 +630,86 @@ def parse_action_from_tools(tool_calls: list[Any]) -> CloudScaleAction:
     return CloudScaleAction(hpa=hpa, vpa=vpa, traffic=traffic, node=node, no_op=no_op)
 
 
+def _strip_markdown_fence(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```")
+        if text.endswith("```"):
+            text = text[:-3]
+    return text.strip()
+
+
+def maybe_apply_internal_feedback(
+    obs: CloudScaleObservation,
+    proposed_action: CloudScaleAction,
+    reward_history: list[float],
+    model: str = FEEDBACK_MODEL,
+) -> tuple[CloudScaleAction, dict[str, Any]]:
+    """
+    Run a second-pass critic model over the proposed action.
+    If critic rejects and returns a valid revised_action, use it.
+    Otherwise keep original action.
+    """
+    prompt = (
+        f"OBSERVATION:\n{obs_to_prompt(obs, reward_history)}\n\n"
+        f"PROPOSED_ACTION:\n{proposed_action.model_dump_json(exclude_none=True)}\n\n"
+        "Respond with JSON only."
+    )
+
+    try:
+        completion = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": FEEDBACK_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=FEEDBACK_TEMPERATURE,
+            max_tokens=FEEDBACK_MAX_TOKENS,
+        )
+
+        raw = completion.choices[0].message.content or "{}"
+        data = json.loads(_strip_markdown_fence(raw))
+
+        accepted = bool(data.get("accept", True))
+        reason = str(data.get("reason", "approved"))
+
+        if accepted:
+            return proposed_action, {
+                "enabled": True,
+                "accepted": True,
+                "reason": reason,
+                "model": model,
+            }
+
+        revised = data.get("revised_action")
+        if revised is None:
+            return proposed_action, {
+                "enabled": True,
+                "accepted": True,
+                "reason": f"critic_rejected_without_revision:{reason}",
+                "model": model,
+            }
+
+        revised_action = CloudScaleAction(**revised)
+        return revised_action, {
+            "enabled": True,
+            "accepted": False,
+            "reason": reason,
+            "model": model,
+        }
+
+    except Exception as exc:
+        console.print(
+            f"[yellow][WARN] Internal feedback unavailable: {exc}. Using original action.[/yellow]"
+        )
+        return proposed_action, {
+            "enabled": True,
+            "accepted": True,
+            "reason": "feedback_unavailable",
+            "model": model,
+        }
+
+
 # ── Main Agent Loop ───────────────────────────────────────────────────────────
 
 
@@ -631,6 +739,7 @@ def run_episode(
             t0 = time.time()
             obs_text = obs_to_prompt(obs, reward_history)
             messages = ctx.build_messages(obs_text)
+            feedback_meta: Optional[dict[str, Any]] = None
 
             if USE_TOOLS:
                 completion = openai_client.chat.completions.create(
@@ -658,6 +767,13 @@ def run_episode(
                 raw = completion.choices[0].message.content or "{}"
                 action = parse_action_from_json(raw)
 
+            if ENABLE_INTERNAL_FEEDBACK:
+                action, feedback_meta = maybe_apply_internal_feedback(
+                    obs=obs,
+                    proposed_action=action,
+                    reward_history=reward_history,
+                )
+
             # Step via EnvClient
             result = env.step(action)
             obs = result.observation
@@ -670,7 +786,14 @@ def run_episode(
 
             elapsed = time.time() - t0
             step_times.append(elapsed)
-            _print_tick(obs, action, reward, elapsed, getattr(completion, "usage", None))
+            _print_tick(
+                obs,
+                action,
+                reward,
+                elapsed,
+                getattr(completion, "usage", None),
+                feedback_meta,
+            )
 
     mean_reward = total_reward / max(len(reward_history), 1)
     console.print(Panel(
@@ -693,16 +816,23 @@ def _print_tick(
     reward: float,
     elapsed: float,
     usage: Any,
+    feedback_meta: Optional[dict[str, Any]] = None,
 ) -> None:
     color = "green" if reward > 0 else "red"
     slo = "✅" if obs.global_slo_met else "⚠️ "
     action_str = action.model_dump_json(exclude_none=True)
     tok = f"{usage.total_tokens}tok" if usage else ""
+    feedback_str = ""
+    if feedback_meta and feedback_meta.get("enabled"):
+        if feedback_meta.get("accepted"):
+            feedback_str = "critic=approved"
+        else:
+            feedback_str = "critic=rewrote"
     console.print(
         f"[dim]tick {obs.step:4d}[/dim]  "
         f"slo={slo}  cost=${obs.total_cost_usd_per_hour:.2f}/hr  "
         f"[{color}]reward={reward:+.3f}[/{color}]  "
-        f"[dim]{action_str[:80]}  {elapsed:.1f}s {tok}[/dim]"
+        f"[dim]{action_str[:80]}  {elapsed:.1f}s {tok} {feedback_str}[/dim]"
     )
 
 
