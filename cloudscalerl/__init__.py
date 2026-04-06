@@ -6,11 +6,11 @@
 
 """Cloudscalerl Environment."""
 
-from .client import CloudscalerlEnv
-from .models import CloudscalerlAction, CloudscalerlObservation
+from .client import CloudScaleEnv
+from .models import CloudScaleAction, CloudScaleObservation
 
 __all__ = [
-    "CloudscalerlAction",
-    "CloudscalerlObservation",
-    "CloudscalerlEnv",
+    "CloudScaleAction",
+    "CloudScaleObservation",
+    "CloudScaleEnv",
 ]

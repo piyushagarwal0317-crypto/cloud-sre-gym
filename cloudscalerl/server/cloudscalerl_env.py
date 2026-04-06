@@ -1,14 +1,19 @@
 """
-CloudScaleRL Core Environment
-================================
-Simulates a Kubernetes cluster with:
-  - Realistic action delays (pod scheduling: 2 ticks, node provisioning: 5 ticks)
-  - HPA / VPA / Traffic routing / Node management
-  - Workload traces (diurnal, flash-sale, incident)
-  - Spot instance preemption
-  - Carbon intensity per region
-  - Pending events visible to agent
-  - Counterfactual oracle cost
+CloudScaleRL Environment Server — built on openenv.core.EnvServer.
+
+Follows the same pattern as dm_control_env's server/app.py:
+  - Inherits EnvServer (or composes FastAPI app the openenv way)
+  - _step() applies the action and returns (observation, reward, done, info)
+  - _reset() initialises a fresh episode and returns the first observation
+  - _get_state() returns CloudScaleState for GET /state
+  - render() returns a JSON dashboard snapshot (like dm_control render=True)
+
+The simulation physics:
+  - Pod scheduling delay: 2 ticks
+  - Node provisioning delay: 5 ticks
+  - Latency model: M/D/1 queue approximation
+  - Spot preemption: ~5% chance per tick per spot region
+  - Carbon intensity: live from Electricity Maps API (falls back to static defaults)
 """
 
 from __future__ import annotations
@@ -17,56 +22,121 @@ import json
 import math
 import os
 import random
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from openenv.core.env_server import EnvServer
+    from openenv.core.env_server.types import StepResult
+    _HAS_OPENENV = True
+except ImportError:
+    _HAS_OPENENV = False
+    EnvServer = object  # type: ignore[assignment,misc]
+    StepResult = dict   # type: ignore[assignment]
+
 from cloudscalerl.models import (
-    Action,
-    HPAAction,
-    NodeAction,
-    Observation,
+    CloudScaleAction,
+    CloudScaleObservation,
+    CloudScaleReward,
+    CloudScaleState,
     RegionState,
-    Reward,
     ServiceMetrics,
-    TrafficAction,
-    VPAAction,
 )
+
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 TRACES_DIR = Path(__file__).parent / "workload_traces"
 
-# Static carbon intensity fallbacks (gCO2/kWh) when Electricity Maps API is absent
-CARBON_DEFAULTS = {
-    "us-east-1": 380.0,
-    "eu-west-1": 210.0,
+TICK_DURATION_S = 60
+POD_SCHEDULING_TICKS = 0 # Curriculum Learning: Start with 0 delays to help the agent learn basics
+NODE_PROVISIONING_TICKS = 0 # Curriculum Learning: Start with 0 delays 
+POD_STARTUP_MEAN_S = 45
+POD_STARTUP_STD_S = 10
+
+NODE_COSTS: dict[str, float] = {
+    "m5.large":      0.096,
+    "m5.xlarge":     0.192,
+    "c5.xlarge":     0.170,
+    "c5.2xlarge":    0.340,
+    "spot.c5.xlarge": 0.051,
+    "spot.m5.large":  0.029,
+}
+
+CARBON_DEFAULTS: dict[str, float] = {
+    "us-east-1":  380.0,
+    "eu-west-1":  210.0,
     "ap-south-1": 720.0,
 }
 
-NODE_COSTS: dict[str, float] = {
-    "m5.large": 0.096,
-    "m5.xlarge": 0.192,
-    "c5.xlarge": 0.170,
-    "c5.2xlarge": 0.340,
-    "spot.c5.xlarge": 0.051,   # 70% cheaper than on-demand
-    "spot.m5.large": 0.029,
+ACTION_SPEC: dict[str, Any] = {
+    "hpa": {
+        "target_replicas": [1, 100],
+        "min_replicas": [1, 100],
+        "max_replicas": [1, 100],
+        "target_cpu_utilization": [0.1, 0.95],
+    },
+    "vpa": {
+        "cpu_request_millicores": [10, 32000],
+        "memory_request_mb": [64, 131072],
+    },
+    "traffic": {
+        "region_weights": "Dict[str, float] — must sum to 1.0",
+    },
+    "node": {
+        "operation": ["add", "remove", "change_type"],
+        "count": [1, 20],
+    },
 }
 
-POD_SCHEDULING_TICKS = 2
-NODE_PROVISIONING_TICKS = 5
-POD_STARTUP_MEAN_S = 45
-POD_STARTUP_STD_S = 10
-TICK_DURATION_S = 60
+OBSERVATION_SPEC: dict[str, Any] = {
+    "services": {
+        "replicas": "int ge 0",
+        "cpu_utilization": "float 0–1",
+        "memory_utilization": "float 0–1",
+        "requests_per_second": "float ge 0",
+        "p99_latency_ms": "float ge 0",
+        "error_rate": "float 0–1",
+        "cpu_request_millicores": "int ge 1",
+        "memory_request_mb": "int ge 1",
+        "pending_replicas": "Optional[int]",
+    },
+    "regions": {
+        "traffic_weight": "float 0–1 (sum across regions = 1.0)",
+        "node_count": "int ge 0",
+        "node_type": "str",
+        "cost_per_hour": "float ge 0",
+        "is_degraded": "bool",
+        "is_spot": "bool",
+        "carbon_intensity_gco2_kwh": "float",
+    },
+}
+
+
+# ── Internal simulation state (not exposed to agent) ─────────────────────────
 
 
 @dataclass
-class PendingScaleEvent:
+class _ServiceState:
+    replicas: int
+    cpu_request_millicores: int
+    memory_request_mb: int
+    min_replicas: int = 1
+    max_replicas: int = 50
+    target_cpu_utilization: float = 0.70
+    replica_history: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _PendingScale:
     service: str
     target_replicas: int
     ticks_remaining: int
 
 
 @dataclass
-class PendingNodeEvent:
+class _PendingNode:
     region: str
     operation: str
     node_type: str
@@ -74,119 +144,158 @@ class PendingNodeEvent:
     ticks_remaining: int
 
 
-@dataclass
-class ServiceState:
-    replicas: int
-    cpu_request_millicores: int
-    memory_request_mb: int
-    min_replicas: int = 1
-    max_replicas: int = 50
-    target_cpu_utilization: float = 0.7
-    # Replica history for thrash detection
-    replica_history: list[int] = field(default_factory=list)
+# ── Environment class ─────────────────────────────────────────────────────────
 
 
-class CloudScaleEnvironment:
+class CloudScaleEnvServer(EnvServer):
     """
-    Core RL environment. Instantiated per-episode via reset().
-    Not thread-safe — run one episode per instance.
+    CloudScaleRL environment — openenv EnvServer subclass.
+
+    Instantiate directly or mount onto an existing FastAPI app:
+
+        app = FastAPI()
+        env_server = CloudScaleEnvServer()
+        app.include_router(env_server.router)
+
+    Or use standalone (openenv handles the FastAPI wiring):
+
+        server = CloudScaleEnvServer()
+        server.serve(port=8000)
     """
 
-    def __init__(self, task_config: dict[str, Any], seed: int = 42) -> None:
-        self.task_config = task_config
-        self.seed = seed
-        self.rng = random.Random(seed)
+    def __init__(self) -> None:
+        if _HAS_OPENENV:
+            super().__init__()
+
+        # Episode state — reset by _reset()
+        self._task_config: dict[str, Any] = {}
+        self._seed: int = 42
+        self._rng: random.Random = random.Random(42)
+        self._step_count: int = 0
+        self._max_steps: int = 480
+        self._budget_usd_per_hr: float = 50.0
+        self._budget_remaining: float = 0.0
+        self._episode_id: Optional[str] = None
+
+        self._services: dict[str, _ServiceState] = {}
+        self._regions: dict[str, RegionState] = {}
+        self._pending_scale: list[_PendingScale] = []
+        self._pending_nodes: list[_PendingNode] = []
+        self._trace: list[float] = []
+        self._metrics_cache: dict[str, ServiceMetrics] = {}
+
+    # ── openenv EnvServer interface ───────────────────────────────────────────
+
+    def _reset(
+        self,
+        task_id: str = "task1_hpa",
+        seed: int = 42,
+        render: bool = False,
+        **kwargs: Any,
+    ) -> CloudScaleObservation:
+        """
+        Initialise a fresh episode.
+        Called by EnvServer when POST /reset is received.
+        Mirrors DMControlEnv.reset() signature pattern.
+        """
+        from cloudscalerl.tasks.Task1hpa import TASK_CONFIG as TASK1_CONFIG
+        from cloudscalerl.tasks.Task2cost import TASK_CONFIG as TASK2_CONFIG
+        from cloudscalerl.tasks.Task3incident import TASK_CONFIG as TASK3_CONFIG
+
+        task_map = {
+            "task1_hpa": TASK1_CONFIG,
+            "task2_cost": TASK2_CONFIG,
+            "task3_incident": TASK3_CONFIG,
+        }
+        if task_id not in task_map:
+            raise ValueError(
+                f"Unknown task_id '{task_id}'. "
+                f"Valid options: {list(task_map.keys())}"
+            )
+
+        self._task_config = task_map[task_id]
+        self._seed = seed
+        self._rng = random.Random(seed)
+        self._step_count = 0
+        self._max_steps = self._task_config["max_steps"]
+        self._budget_usd_per_hr = self._task_config.get("budget_usd_per_hr", 50.0)
+        self._budget_remaining = self._budget_usd_per_hr * (
+            self._max_steps * TICK_DURATION_S / 3600
+        )
+        self._episode_id = str(uuid.uuid4())
+        self._pending_scale = []
+        self._pending_nodes = []
+        self._metrics_cache = {}
+
         self._load_trace()
-        self.step_count = 0
-        self.max_steps = task_config["max_steps"]
-        self.budget_usd_per_hr = task_config.get("budget_usd_per_hr", 50.0)
-        self.budget_remaining = self.budget_usd_per_hr * (self.max_steps * TICK_DURATION_S / 3600)
-        self.services: dict[str, ServiceState] = {}
-        self.regions: dict[str, RegionState] = {}
-        self.pending_scale: list[PendingScaleEvent] = []
-        self.pending_nodes: list[PendingNodeEvent] = []
         self._init_cluster()
 
-    # ── Initialisation ────────────────────────────────────────────────────────
+        return self._build_observation(render=render)
 
-    def _load_trace(self) -> None:
-        pattern = self.task_config.get("trace_pattern", "diurnal")
-        trace_file = TRACES_DIR / f"{pattern}.json"
-        if trace_file.exists():
-            with open(trace_file) as f:
-                self.trace: list[float] = json.load(f)
-        else:
-            # Generate synthetic trace on-the-fly
-            self.trace = _generate_trace(self.seed, pattern, self.task_config["max_steps"])
-
-    def _init_cluster(self) -> None:
-        for svc_name in self.task_config["services"]:
-            self.services[svc_name] = ServiceState(
-                replicas=2,
-                cpu_request_millicores=500,
-                memory_request_mb=512,
-            )
-
-        for i, region_id in enumerate(self.task_config["regions"]):
-            n = len(self.task_config["regions"])
-            self.regions[region_id] = RegionState(
-                region_id=region_id,
-                traffic_weight=round(1.0 / n, 4),
-                node_count=3,
-                node_type="m5.large",
-                cost_per_hour=3 * NODE_COSTS["m5.large"],
-                is_degraded=False,
-                carbon_intensity_gco2_kwh=_fetch_carbon(region_id),
-            )
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def reset(self) -> Observation:
-        self.__init__(self.task_config, self.seed)
-        return self._build_observation()
-
-    def step(self, action: Action) -> tuple[Observation, Reward, bool, dict[str, Any]]:
-        # 1. Validate & apply penalty for constraint violations
+    def _step(
+        self,
+        action: CloudScaleAction,
+        render: bool = False,
+        **kwargs: Any,
+    ) -> tuple[CloudScaleObservation, float, bool, dict[str, Any]]:
+        """
+        Advance one tick.
+        Called by EnvServer when POST /step is received.
+        Returns (observation, reward_scalar, done, info).
+        """
+        # 1. Constraint checking → penalty
         penalty = self._check_constraints(action)
 
-        # 2. Apply action (with delays)
+        # 2. Apply action (with realistic delays)
         self._apply_action(action)
 
-        # 3. Advance simulation clock
+        # 3. Advance pending events (pod scheduling, node provisioning)
         self._advance_pending_events()
+
+        # 4. Advance workload trace → update metrics cache
         self._advance_workload()
 
-        # 4. Inject task-specific events (AZ failure, spot preemption, etc.)
+        # 5. Inject task-specific events (AZ failure, spot preemption, etc.)
         self._inject_events()
 
-        # 5. Compute reward components
-        slo_score = self._compute_slo_score()
-        cost_score = self._compute_cost_efficiency()
-        stability = self._compute_stability()
+        # Reward Shaping: Anticipation bonus
+        anticipation_bonus = 0.0
+        if action.hpa and action.hpa.service in self._services:
+            m = self._metrics_cache.get(action.hpa.service)
+            if m and m.cpu_utilization > 0.80 and action.hpa.target_replicas:
+                current_replicas = self._services[action.hpa.service].replicas
+                if action.hpa.target_replicas > current_replicas:
+                    anticipation_bonus = 0.2
 
-        # 6. Shape reward
-        raw = (
+        # 6. Compute reward components
+        slo_score   = self._compute_slo_score()
+        cost_score  = self._compute_cost_efficiency()
+        stability   = self._compute_stability()
+
+        raw_reward = (
             0.4 * slo_score
             + 0.3 * cost_score
             + 0.2 * stability
+            + anticipation_bonus
             - 0.3 * penalty
         )
-        total_reward = max(-1.0, min(1.0, raw))
+        total_reward = max(-1.0, min(1.0, raw_reward))
 
-        # 7. Update budget
+        # 7. Drain budget
         hourly_cost = self._current_cost_per_hour()
-        self.budget_remaining -= hourly_cost * (TICK_DURATION_S / 3600)
+        self._budget_remaining -= hourly_cost * (TICK_DURATION_S / 3600)
 
-        self.step_count += 1
+        self._step_count += 1
 
         done = (
-            self.step_count >= self.max_steps
-            or self.budget_remaining <= -50.0  # allow small overage before terminating
+            self._step_count >= self._max_steps
+            or self._budget_remaining <= -50.0
             or self._catastrophic_failure()
         )
 
-        obs = self._build_observation()
-        reward = Reward(
+        obs = self._build_observation(render=render)
+
+        reward_detail = CloudScaleReward(
             total=total_reward,
             slo_component=slo_score,
             cost_component=cost_score,
@@ -194,36 +303,143 @@ class CloudScaleEnvironment:
             penalty=penalty,
             breakdown=self._reward_breakdown(),
         )
-        return obs, reward, done, {"step": self.step_count}
 
-    # ── Constraint Checking ───────────────────────────────────────────────────
+        info: dict[str, Any] = {
+            "step": self._step_count,
+            "reward_detail": reward_detail.model_dump(),
+            "done": done,
+        }
+        return obs, total_reward, done, info
 
-    def _check_constraints(self, action: Action) -> float:
+    def _get_state(self) -> CloudScaleState:
+        """
+        Return current environment metadata.
+        Called by EnvServer when GET /state is received.
+        Mirrors DMControlState structure.
+        """
+        return CloudScaleState(
+            episode_id=self._episode_id,
+            step_count=self._step_count,
+            task_id=self._task_config.get("id", ""),
+            max_steps=self._max_steps,
+            budget_usd_per_hr=self._budget_usd_per_hr,
+            services=list(self._services.keys()),
+            regions=list(self._regions.keys()),
+            trace_pattern=self._task_config.get("trace_pattern", "diurnal"),
+            action_spec=ACTION_SPEC,
+            observation_spec=OBSERVATION_SPEC,
+        )
+
+    def render(self) -> dict[str, Any]:
+        """
+        JSON dashboard snapshot — human-readable cluster state.
+        Analogous to dm_control render=True returning pixels.
+        Called by GET /render.
+        """
+        obs = self._build_observation()
+        return {
+            "step": self._step_count,
+            "episode_id": self._episode_id,
+            "slo_status": "MET" if obs.global_slo_met else "BREACHED",
+            "cost_usd_per_hr": round(obs.total_cost_usd_per_hour, 4),
+            "oracle_cost_usd_per_hr": round(
+                obs.counterfactual_cost_usd_per_hour or 0, 4
+            ),
+            "budget_remaining": round(obs.budget_remaining_usd, 2),
+            "services": {
+                name: {
+                    "replicas": m.replicas,
+                    "pending_replicas": m.pending_replicas,
+                    "cpu": f"{m.cpu_utilization:.0%}",
+                    "mem": f"{m.memory_utilization:.0%}",
+                    "p99_ms": round(m.p99_latency_ms, 1),
+                    "errors": f"{m.error_rate:.4%}",
+                    "cpu_req": f"{m.cpu_request_millicores}m",
+                    "mem_req": f"{m.memory_request_mb}MB",
+                }
+                for name, m in self._metrics_cache.items()
+            },
+            "regions": {
+                rid: {
+                    "weight": f"{r.traffic_weight:.0%}",
+                    "nodes": r.node_count,
+                    "type": r.node_type,
+                    "cost_hr": round(r.cost_per_hour, 3),
+                    "degraded": r.is_degraded,
+                    "spot": r.is_spot,
+                    "carbon_gco2_kwh": r.carbon_intensity_gco2_kwh,
+                }
+                for rid, r in self._regions.items()
+            },
+            "pending_events": self._build_pending_events(),
+        }
+
+    # ── Cluster initialisation ────────────────────────────────────────────────
+
+    def _load_trace(self) -> None:
+        pattern = self._task_config.get("trace_pattern", "diurnal")
+        trace_file = TRACES_DIR / f"{pattern}.json"
+        if trace_file.exists():
+            with open(trace_file) as f:
+                self._trace = json.load(f)
+        else:
+            self._trace = _generate_trace(
+                self._seed, pattern, self._max_steps
+            )
+
+    def _init_cluster(self) -> None:
+        self._services = {
+            name: _ServiceState(
+                replicas=2,
+                cpu_request_millicores=500,
+                memory_request_mb=512,
+            )
+            for name in self._task_config["services"]
+        }
+
+        n_regions = len(self._task_config["regions"])
+        self._regions = {
+            rid: RegionState(
+                region_id=rid,
+                traffic_weight=round(1.0 / n_regions, 4),
+                node_count=3,
+                node_type="m5.large",
+                cost_per_hour=3 * NODE_COSTS["m5.large"],
+                carbon_intensity_gco2_kwh=_fetch_carbon(rid),
+            )
+            for rid in self._task_config["regions"]
+        }
+
+    # ── Constraint checking ───────────────────────────────────────────────────
+
+    def _check_constraints(self, action: CloudScaleAction) -> float:
         penalty = 0.0
 
         if action.hpa:
-            svc = self.services.get(action.hpa.service)
+            svc = self._services.get(action.hpa.service)
             if svc is None:
-                penalty += 0.5  # unknown service
-            elif action.hpa.target_replicas and action.hpa.target_replicas < svc.min_replicas:
-                penalty += 0.3  # below PodDisruptionBudget min
+                penalty += 0.5
+            elif (
+                action.hpa.target_replicas
+                and action.hpa.target_replicas < svc.min_replicas
+            ):
+                penalty += 0.3  # PodDisruptionBudget violation
 
         if action.traffic and action.traffic.region_weights:
             total = sum(action.traffic.region_weights.values())
             if abs(total - 1.0) > 0.02:
-                penalty += 0.4  # weights don't sum to 1
+                penalty += 0.4
 
-        if self.budget_remaining <= 0:
-            penalty += 0.2  # already over budget
+        if self._budget_remaining <= 0:
+            penalty += 0.2
 
         return min(penalty, 1.0)
 
-    # ── Action Application ────────────────────────────────────────────────────
+    # ── Action application ────────────────────────────────────────────────────
 
-    def _apply_action(self, action: Action) -> None:
+    def _apply_action(self, action: CloudScaleAction) -> None:
         if action.no_op:
             return
-
         if action.hpa:
             self._apply_hpa(action.hpa)
         if action.vpa:
@@ -233,8 +449,8 @@ class CloudScaleEnvironment:
         if action.node:
             self._apply_node(action.node)
 
-    def _apply_hpa(self, hpa: HPAAction) -> None:
-        svc = self.services.get(hpa.service)
+    def _apply_hpa(self, hpa: Any) -> None:
+        svc = self._services.get(hpa.service)
         if svc is None:
             return
         if hpa.min_replicas:
@@ -244,14 +460,15 @@ class CloudScaleEnvironment:
         if hpa.target_cpu_utilization:
             svc.target_cpu_utilization = hpa.target_cpu_utilization
         if hpa.target_replicas:
-            target = max(svc.min_replicas, min(svc.max_replicas, hpa.target_replicas))
-            # Schedule with 2-tick delay
-            self.pending_scale.append(
-                PendingScaleEvent(hpa.service, target, POD_SCHEDULING_TICKS)
+            target = max(
+                svc.min_replicas, min(svc.max_replicas, hpa.target_replicas)
+            )
+            self._pending_scale.append(
+                _PendingScale(hpa.service, target, POD_SCHEDULING_TICKS)
             )
 
-    def _apply_vpa(self, vpa: VPAAction) -> None:
-        svc = self.services.get(vpa.service)
+    def _apply_vpa(self, vpa: Any) -> None:
+        svc = self._services.get(vpa.service)
         if svc is None:
             return
         if vpa.cpu_request_millicores:
@@ -259,49 +476,50 @@ class CloudScaleEnvironment:
         if vpa.memory_request_mb:
             svc.memory_request_mb = vpa.memory_request_mb
 
-    def _apply_traffic(self, traffic: TrafficAction) -> None:
+    def _apply_traffic(self, traffic: Any) -> None:
         if traffic.region_weights:
             for rid, w in traffic.region_weights.items():
-                if rid in self.regions:
-                    self.regions[rid].traffic_weight = w
+                if rid in self._regions:
+                    self._regions[rid].traffic_weight = w
         elif traffic.failover_from and traffic.failover_to:
-            src = self.regions.get(traffic.failover_from)
-            dst = self.regions.get(traffic.failover_to)
+            src = self._regions.get(traffic.failover_from)
+            dst = self._regions.get(traffic.failover_to)
             if src and dst:
                 dst.traffic_weight += src.traffic_weight
                 src.traffic_weight = 0.0
 
-    def _apply_node(self, node: NodeAction) -> None:
-        region = self.regions.get(node.region)
-        if region is None:
+    def _apply_node(self, node: Any) -> None:
+        if node.region not in self._regions:
             return
-        nt = node.node_type or region.node_type
-        self.pending_nodes.append(
-            PendingNodeEvent(node.region, node.operation, nt, node.count, NODE_PROVISIONING_TICKS)
+        nt = node.node_type or self._regions[node.region].node_type
+        self._pending_nodes.append(
+            _PendingNode(
+                node.region, node.operation, nt, node.count, NODE_PROVISIONING_TICKS
+            )
         )
 
-    # ── Pending Event Resolution ──────────────────────────────────────────────
+    # ── Pending event resolution ──────────────────────────────────────────────
 
     def _advance_pending_events(self) -> None:
-        # Pod scaling
-        resolved_scale = []
-        for ev in self.pending_scale:
+        # Pod scheduling
+        still_pending: list[_PendingScale] = []
+        for ev in self._pending_scale:
             ev.ticks_remaining -= 1
             if ev.ticks_remaining <= 0:
-                svc = self.services.get(ev.service)
+                svc = self._services.get(ev.service)
                 if svc:
                     svc.replicas = ev.target_replicas
                     svc.replica_history.append(ev.target_replicas)
             else:
-                resolved_scale.append(ev)
-        self.pending_scale = resolved_scale
+                still_pending.append(ev)
+        self._pending_scale = still_pending
 
         # Node provisioning
-        resolved_nodes = []
-        for ev in self.pending_nodes:
+        still_nodes: list[_PendingNode] = []
+        for ev in self._pending_nodes:
             ev.ticks_remaining -= 1
             if ev.ticks_remaining <= 0:
-                region = self.regions.get(ev.region)
+                region = self._regions.get(ev.region)
                 if region:
                     if ev.operation == "add":
                         region.node_count += ev.count
@@ -310,168 +528,159 @@ class CloudScaleEnvironment:
                     elif ev.operation == "change_type":
                         region.node_type = ev.node_type
                         region.is_spot = ev.node_type.startswith("spot.")
-                    region.cost_per_hour = region.node_count * NODE_COSTS.get(region.node_type, 0.096)
+                    region.cost_per_hour = region.node_count * NODE_COSTS.get(
+                        region.node_type, 0.096
+                    )
             else:
-                resolved_nodes.append(ev)
-        self.pending_nodes = resolved_nodes
+                still_nodes.append(ev)
+        self._pending_nodes = still_nodes
 
-    # ── Workload Simulation ───────────────────────────────────────────────────
+    # ── Workload simulation ───────────────────────────────────────────────────
 
     def _advance_workload(self) -> None:
         """
-        Compute simulated metrics for this tick based on the workload trace.
-        Uses a simplified queueing model: latency ~ load / (capacity - load).
+        Compute per-service metrics for this tick.
+        Uses an M/D/1 queue approximation: p99 latency rises sharply as
+        CPU utilisation approaches 1.0 — forces the agent to maintain headroom.
         """
-        tick_idx = self.step_count % len(self.trace)
-        load_multiplier = self.trace[tick_idx]
+        tick_idx = self._step_count % len(self._trace)
+        load_mult = self._trace[tick_idx]
 
-        for svc_name, svc in self.services.items():
-            capacity = svc.replicas * (svc.cpu_request_millicores / 500.0)
-            demand = load_multiplier * 2.0 * svc.replicas  # base RPS proportional to replicas
+        for name, svc in self._services.items():
+            # Effective capacity scales with replica count and per-pod CPU request
+            capacity_factor = svc.replicas * (svc.cpu_request_millicores / 500.0)
+            demand = load_mult * 2.0 * svc.replicas
 
-            # CPU utilization
-            cpu_util = min(0.99, (load_multiplier * 0.6) / max(capacity / svc.replicas, 0.01))
-            cpu_util += self.rng.gauss(0, 0.02)
-            cpu_util = max(0.0, min(0.99, cpu_util))
+            # CPU utilisation
+            cpu_util = min(
+                0.99,
+                (load_mult * 0.6) / max(capacity_factor / max(svc.replicas, 1), 0.01),
+            )
+            cpu_util = max(0.0, min(0.99, cpu_util + self._rng.gauss(0, 0.02)))
 
-            # Memory utilization (slower to change)
-            mem_util = 0.4 + (cpu_util * 0.3) + self.rng.gauss(0, 0.01)
-            mem_util = max(0.0, min(0.99, mem_util))
+            mem_util = max(
+                0.0, min(0.99, 0.4 + cpu_util * 0.3 + self._rng.gauss(0, 0.01))
+            )
 
-            # Latency: M/D/1 queue model approximation
-            rho = cpu_util  # server utilization
+            # M/D/1 queue: p99 ≈ base_service_time + queueing_delay * 2.5
+            rho = cpu_util
             if rho < 0.99:
-                base_latency = 50.0  # ms service time
-                queueing_latency = base_latency * rho / (2 * (1 - rho))
-                p99_latency = base_latency + queueing_latency * 2.5
+                base_ms = 50.0
+                queue_ms = base_ms * rho / (2 * (1 - rho))
+                p99 = base_ms + queue_ms * 2.5
             else:
-                p99_latency = 2000.0  # saturated
+                p99 = 2000.0
 
-            p99_latency = max(20.0, p99_latency + self.rng.gauss(0, 5.0))
+            p99 = max(20.0, p99 + self._rng.gauss(0, 5.0))
 
-            # Error rate rises sharply when latency > 500ms
-            if p99_latency > 500:
-                error_rate = min(0.05, (p99_latency - 500) / 10000)
-            else:
-                error_rate = max(0.0, self.rng.gauss(0.0001, 0.00005))
+            # Error rate spikes sharply above 500ms
+            error_rate = (
+                min(0.05, (p99 - 500) / 10000) if p99 > 500
+                else max(0.0, self._rng.gauss(0.0001, 0.00005))
+            )
 
-            # Update metrics (in-place via dict mutation — ServiceState holds scalars)
-            self._service_metrics_cache[svc_name] = ServiceMetrics(
+            self._metrics_cache[name] = ServiceMetrics(
                 replicas=svc.replicas,
                 cpu_utilization=round(cpu_util, 4),
                 memory_utilization=round(mem_util, 4),
                 requests_per_second=round(demand, 1),
-                p99_latency_ms=round(p99_latency, 1),
+                p99_latency_ms=round(p99, 1),
                 error_rate=round(error_rate, 6),
                 cpu_request_millicores=svc.cpu_request_millicores,
                 memory_request_mb=svc.memory_request_mb,
-                pending_replicas=self._get_pending_replicas(svc_name),
+                pending_replicas=self._get_pending_replicas(name),
             )
 
-    @property
-    def _service_metrics_cache(self) -> dict[str, ServiceMetrics]:
-        if not hasattr(self, "_svc_cache"):
-            self._svc_cache: dict[str, ServiceMetrics] = {}
-        return self._svc_cache
-
-    def _get_pending_replicas(self, service: str) -> int | None:
-        for ev in self.pending_scale:
+    def _get_pending_replicas(self, service: str) -> Optional[int]:
+        for ev in self._pending_scale:
             if ev.service == service:
                 return ev.target_replicas
         return None
 
-    # ── Event Injection ───────────────────────────────────────────────────────
+    # ── Task event injection ──────────────────────────────────────────────────
 
     def _inject_events(self) -> None:
-        task_id = self.task_config.get("id", "")
+        task_id = self._task_config.get("id", "")
 
-        # Task 3: AZ degradation at tick 30
+        # Task 3: AZ degradation
         if task_id == "task3_incident":
-            incident_tick = self.task_config.get("incident_tick", 30)
-            incident_region = self.task_config.get("incident_region", "us-east-1")
-            if self.step_count == incident_tick:
-                if incident_region in self.regions:
-                    self.regions[incident_region].is_degraded = True
-            # Recovery at tick 150
-            if self.step_count == 150:
-                if incident_region in self.regions:
-                    self.regions[incident_region].is_degraded = False
+            incident_tick = self._task_config.get("incident_tick", 30)
+            incident_region = self._task_config.get("incident_region", "us-east-1")
+            if self._step_count == incident_tick and incident_region in self._regions:
+                self._regions[incident_region].is_degraded = True
+            if self._step_count == 150 and incident_region in self._regions:
+                self._regions[incident_region].is_degraded = False
 
-        # Spot preemption (random, ~5% chance per tick per spot region)
-        for rid, region in self.regions.items():
-            if region.is_spot and self.rng.random() < 0.05:
+        # Spot preemption: ~5% chance per tick per spot region
+        for region in self._regions.values():
+            if region.is_spot and self._rng.random() < 0.05:
                 region.node_count = max(1, region.node_count - 1)
-                region.cost_per_hour = region.node_count * NODE_COSTS.get(region.node_type, 0.029)
+                region.cost_per_hour = region.node_count * NODE_COSTS.get(
+                    region.node_type, 0.029
+                )
 
-    # ── Reward Computation ────────────────────────────────────────────────────
+    # ── Reward computation ────────────────────────────────────────────────────
 
     def _compute_slo_score(self) -> float:
-        if not self._service_metrics_cache:
+        if not self._metrics_cache:
             return 0.5
-        compliant = sum(
-            1
-            for m in self._service_metrics_cache.values()
-            if m.p99_latency_ms < 200 and m.error_rate < 0.001
-        )
-        return compliant / len(self._service_metrics_cache)
+            
+        ok = 0
+        for m in self._metrics_cache.values():
+            if m.p99_latency_ms >= 200 or m.error_rate >= 0.001:
+                # Massively penalize a single SLO violation, breaking the "Do Nothing" trap
+                return -5.0
+            ok += 1
+            
+        return ok / len(self._metrics_cache)
 
     def _compute_cost_efficiency(self) -> float:
         actual = self._current_cost_per_hour()
         optimal = self._oracle_optimal_cost()
         if optimal <= 0:
             return 1.0
-        efficiency = 1.0 - (actual / optimal)
-        return max(0.0, min(1.0, efficiency))
+        return max(0.0, min(1.0, 1.0 - actual / optimal))
 
     def _compute_stability(self) -> float:
-        """Penalise thrashing: replica count changed >50% in last 3 ticks."""
         score = 1.0
-        for svc in self.services.values():
+        for svc in self._services.values():
             hist = svc.replica_history[-3:]
-            if len(hist) >= 2:
-                for i in range(1, len(hist)):
-                    if hist[i - 1] > 0:
-                        change = abs(hist[i] - hist[i - 1]) / hist[i - 1]
-                        if change > 0.5:
-                            score -= 0.2
+            for i in range(1, len(hist)):
+                if hist[i - 1] > 0:
+                    change = abs(hist[i] - hist[i - 1]) / hist[i - 1]
+                    if change > 0.5:
+                        score -= 0.2
         return max(0.0, score)
 
     def _reward_breakdown(self) -> dict[str, float]:
-        breakdown = {}
-        for name, m in self._service_metrics_cache.items():
-            breakdown[f"{name}_p99"] = m.p99_latency_ms
-            breakdown[f"{name}_err"] = m.error_rate
-        breakdown["cost_per_hr"] = self._current_cost_per_hour()
-        return breakdown
+        bd: dict[str, float] = {"cost_per_hr": self._current_cost_per_hour()}
+        for name, m in self._metrics_cache.items():
+            bd[f"{name}_p99"] = m.p99_latency_ms
+            bd[f"{name}_err"] = m.error_rate
+        return bd
 
     def _current_cost_per_hour(self) -> float:
-        return sum(r.cost_per_hour for r in self.regions.values())
+        return sum(r.cost_per_hour for r in self._regions.values())
 
     def _oracle_optimal_cost(self) -> float:
-        """
-        Greedy bin-packing oracle: minimum cost to serve current load.
-        Uses smallest node type that can handle the demand.
-        """
-        # Simplified: 1 m5.large per 2 replicas across all services
-        total_replicas = sum(s.replicas for s in self.services.values())
+        total_replicas = sum(s.replicas for s in self._services.values())
         nodes_needed = max(1, math.ceil(total_replicas / 2))
         return nodes_needed * NODE_COSTS["m5.large"]
 
     def _catastrophic_failure(self) -> bool:
-        """Episode ends early if ALL regions are degraded simultaneously."""
-        return all(r.is_degraded for r in self.regions.values())
+        return bool(self._regions) and all(
+            r.is_degraded for r in self._regions.values()
+        )
 
-    # ── Observation Builder ───────────────────────────────────────────────────
+    # ── Observation builder ───────────────────────────────────────────────────
 
-    def _build_observation(self) -> Observation:
-        if not self._service_metrics_cache:
-            # First tick — build synthetic initial metrics
-            for svc_name in self.services:
-                svc = self.services[svc_name]
-                self._service_metrics_cache[svc_name] = ServiceMetrics(
+    def _build_observation(self, render: bool = False) -> CloudScaleObservation:
+        if not self._metrics_cache:
+            for name, svc in self._services.items():
+                self._metrics_cache[name] = ServiceMetrics(
                     replicas=svc.replicas,
-                    cpu_utilization=0.3,
-                    memory_utilization=0.4,
+                    cpu_utilization=0.30,
+                    memory_utilization=0.40,
                     requests_per_second=100.0,
                     p99_latency_ms=80.0,
                     error_rate=0.0001,
@@ -481,91 +690,57 @@ class CloudScaleEnvironment:
 
         global_slo = all(
             m.p99_latency_ms < 200 and m.error_rate < 0.001
-            for m in self._service_metrics_cache.values()
+            for m in self._metrics_cache.values()
         )
 
-        pending_events = self._build_pending_events()
-
-        return Observation(
-            step=self.step_count,
-            services=dict(self._service_metrics_cache),
-            regions=dict(self.regions),
+        return CloudScaleObservation(
+            step=self._step_count,
+            services=dict(self._metrics_cache),
+            regions=dict(self._regions),
             total_cost_usd_per_hour=self._current_cost_per_hour(),
-            budget_remaining_usd=self.budget_remaining,
+            budget_remaining_usd=self._budget_remaining,
             global_slo_met=global_slo,
-            pending_events=pending_events,
+            pending_events=self._build_pending_events(),
             counterfactual_cost_usd_per_hour=self._oracle_optimal_cost(),
+            dashboard_json=self.render() if render else None,
         )
 
     def _build_pending_events(self) -> list[str]:
         events: list[str] = []
 
-        # Pending scale events
-        for ev in self.pending_scale:
-            events.append(f"scale_{ev.service}_to_{ev.target_replicas}_t+{ev.ticks_remaining}")
+        for ev in self._pending_scale:
+            events.append(
+                f"scale_{ev.service}_to_{ev.target_replicas}_t+{ev.ticks_remaining}"
+            )
+        for ev in self._pending_nodes:
+            events.append(
+                f"node_{ev.operation}_{ev.region}_t+{ev.ticks_remaining}"
+            )
 
-        # Pending node events
-        for ev in self.pending_nodes:
-            events.append(f"node_{ev.operation}_{ev.region}_t+{ev.ticks_remaining}")
-
-        # Upcoming trace spikes (look-ahead 5 ticks)
-        for lookahead in range(1, 6):
-            future_idx = (self.step_count + lookahead) % len(self.trace)
-            current_idx = self.step_count % len(self.trace)
-            if self.trace[future_idx] > self.trace[current_idx] * 1.5:
-                events.append(f"traffic_spike_t+{lookahead}")
+        # Traffic spike look-ahead (5 ticks)
+        for ahead in range(1, 6):
+            future_idx = (self._step_count + ahead) % len(self._trace)
+            now_idx = self._step_count % len(self._trace)
+            if self._trace[future_idx] > self._trace[now_idx] * 1.5:
+                events.append(f"traffic_spike_t+{ahead}")
                 break
 
-        # Upcoming task events
-        task_id = self.task_config.get("id", "")
-        if task_id == "task3_incident":
-            incident_tick = self.task_config.get("incident_tick", 30)
-            ticks_to_incident = incident_tick - self.step_count
-            if 0 < ticks_to_incident <= 5:
-                region = self.task_config.get("incident_region", "us-east-1")
-                events.append(f"az_degradation_{region}_t+{ticks_to_incident}")
+        # AZ degradation look-ahead (task 3)
+        if self._task_config.get("id") == "task3_incident":
+            incident_tick = self._task_config.get("incident_tick", 30)
+            ticks_to = incident_tick - self._step_count
+            if 0 < ticks_to <= 5:
+                region = self._task_config.get("incident_region", "us-east-1")
+                events.append(f"az_degradation_{region}_t+{ticks_to}")
 
         return events
-
-    def render(self) -> dict[str, Any]:
-        """JSON dashboard snapshot for debugging and judging."""
-        obs = self._build_observation()
-        return {
-            "step": self.step_count,
-            "slo_status": "MET" if obs.global_slo_met else "BREACHED",
-            "cost_usd_per_hr": round(obs.total_cost_usd_per_hour, 4),
-            "oracle_cost_usd_per_hr": round(obs.counterfactual_cost_usd_per_hour or 0, 4),
-            "budget_remaining": round(obs.budget_remaining_usd, 2),
-            "services": {
-                name: {
-                    "replicas": m.replicas,
-                    "cpu": f"{m.cpu_utilization:.0%}",
-                    "p99_ms": m.p99_latency_ms,
-                    "errors": f"{m.error_rate:.4%}",
-                }
-                for name, m in self._service_metrics_cache.items()
-            },
-            "regions": {
-                rid: {
-                    "weight": f"{r.traffic_weight:.0%}",
-                    "nodes": r.node_count,
-                    "degraded": r.is_degraded,
-                    "carbon": r.carbon_intensity_gco2_kwh,
-                }
-                for rid, r in self.regions.items()
-            },
-            "pending_events": obs.pending_events,
-        }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _generate_trace(seed: int, pattern: str, length: int) -> list[float]:
-    """
-    Generate a synthetic workload trace.
-    Patterns: diurnal, flash_sale, incident, adversarial
-    """
+    """Synthetic workload trace generator — used when JSON file is absent."""
     rng = random.Random(seed)
     trace: list[float] = []
 
@@ -573,58 +748,43 @@ def _generate_trace(seed: int, pattern: str, length: int) -> list[float]:
         hour = (t * TICK_DURATION_S / 3600) % 24
 
         if pattern == "diurnal":
-            # Sine wave with business-hours peak
             base = 0.4 + 0.4 * math.sin(math.pi * (hour - 6) / 12)
-            lunch_boost = 0.15 * math.exp(-((hour - 12) ** 2) / 2)
-            val = base + lunch_boost + rng.gauss(0, 0.02)
+            boost = 0.15 * math.exp(-((hour - 12) ** 2) / 2)
+            val = base + boost + rng.gauss(0, 0.02)
+            if t in (60, 61, 240, 241, 420, 421):
+                val = 1.8  # CPU spikes for task 1
 
         elif pattern == "flash_sale":
-            # Weekly baseline + 3x spike at tick 240
-            base = 0.3 + 0.2 * math.sin(math.pi * (hour - 6) / 12)
-            spike = 3.0 if 240 <= t <= 270 else 1.0
-            val = base * spike + rng.gauss(0, 0.02)
+            weekend = 0.7 if (t * TICK_DURATION_S / 3600 / 24) % 7 >= 5 else 1.0
+            base = weekend * (0.3 + 0.2 * math.sin(math.pi * (hour - 6) / 12))
+            val = base * (3.0 if 240 <= t <= 270 else 1.0) + rng.gauss(0, 0.02)
 
         elif pattern == "incident":
-            # Steady traffic that continues through AZ degradation
             base = 0.5 + 0.2 * math.sin(math.pi * hour / 24)
+            if 30 <= t <= 45:
+                base *= 1.3
             val = base + rng.gauss(0, 0.02)
-
-        elif pattern == "adversarial":
-            # Designed to fool threshold policies: spike then immediately drop
-            phase = t % 20
-            if phase < 2:
-                val = 1.8  # trigger over-provisioning
-            elif phase < 10:
-                val = 0.2  # then drop — wasted resources
-            else:
-                val = 0.7  # normal load
-            val += rng.gauss(0, 0.02)
 
         else:
             val = 0.5 + rng.gauss(0, 0.05)
 
-        trace.append(max(0.05, min(3.0, val)))
+        trace.append(round(max(0.05, min(3.0, val)), 4))
 
     return trace
 
 
 def _fetch_carbon(region_id: str) -> float:
-    """
-    Fetch live carbon intensity from Electricity Maps API.
-    Falls back to static defaults if API key is absent.
-    """
+    """Live carbon intensity from Electricity Maps API. Falls back to static defaults."""
     api_key = os.environ.get("ELECTRICITY_MAPS_API_KEY")
     if not api_key:
         return CARBON_DEFAULTS.get(region_id, 400.0)
 
-    # Map region IDs to Electricity Maps zone codes
     zone_map = {
         "us-east-1": "US-MIDA-PJM",
         "eu-west-1": "IE",
         "ap-south-1": "IN-SO",
     }
     zone = zone_map.get(region_id, "US-MIDA-PJM")
-
     try:
         import requests
 

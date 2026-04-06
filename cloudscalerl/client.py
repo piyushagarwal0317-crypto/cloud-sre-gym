@@ -1,11 +1,18 @@
 """
-CloudScaleRL — LLM Reasoning Agent
-====================================
-Replaces hardcoded rule-based policies with a GPT-4o agent that:
-  1. Reads the current cluster observation (formatted as human-readable text)
-  2. Reasons via chain-of-thought about what scaling actions to take
-  3. Outputs a structured JSON Action
-  4. Maintains a rolling memory window + episode compression for long episodes
+CloudScaleRL — LLM Reasoning Agent Client
+==========================================
+Mirrors the DMControlEnv client pattern:
+  - CloudScaleEnv extends EnvClient[CloudScaleAction, CloudScaleObservation, CloudScaleState]
+  - _step_payload()  converts CloudScaleAction → JSON dict for the server
+  - _parse_result()  converts server JSON → StepResult[CloudScaleObservation]
+  - _parse_state()   converts server JSON → CloudScaleState
+
+On top of the openenv plumbing, this module adds the LLM reasoning layer:
+  - SYSTEM_PROMPT      : SRE rules and action schema
+  - ContextManager     : rolling 5-tick window + episode compression
+  - obs_to_prompt()    : formats CloudScaleObservation for the LLM
+  - parse_action_*()   : LLM output → validated CloudScaleAction
+  - run_episode()      : main agent loop using the EnvClient
 
 Usage:
     python -m cloudscalerl.client task1_hpa
@@ -18,20 +25,45 @@ import json
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
-import httpx
 from openai import OpenAI
 from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+try:
+    from openenv.core.client_types import StepResult
+    from openenv.core.env_client import EnvClient
+except ImportError:
+    # Minimal shims so the file is importable without openenv installed
+    from dataclasses import dataclass
+
+    @dataclass
+    class StepResult:           # type: ignore[no-redef]
+        observation: Any
+        reward: Optional[float]
+        done: bool
+
+    class EnvClient:            # type: ignore[no-redef]
+        def __init__(self, base_url: str, **kwargs: Any) -> None:
+            self.base_url = base_url
+
+        def reset(self, **kwargs: Any) -> Any: ...
+        def step(self, action: Any, **kwargs: Any) -> Any: ...
+        def get_state(self) -> Any: ...
+        def close(self) -> None: ...
+        def __enter__(self) -> "EnvClient": return self
+        def __exit__(self, *_: Any) -> None: self.close()
+
 from cloudscalerl.models import (
-    Action,
+    AVAILABLE_TASKS,
+    CloudScaleAction,
+    CloudScaleObservation,
+    CloudScaleState,
     HPAAction,
     NodeAction,
-    Observation,
     TrafficAction,
     VPAAction,
 )
@@ -39,109 +71,309 @@ from cloudscalerl.models import (
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 console = Console()
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+openai_client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY", "dummy_key_for_local_testing"),
+    base_url=os.environ.get("OPENAI_BASE_URL") # Allows pointing to vLLM, Ollama, HuggingFace, etc.
+)
 USE_TOOLS = os.environ.get("USE_TOOLS", "false").lower() == "true"
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "gpt-4o")
-COMPRESS_MODEL = "gpt-4o-mini"  # cheaper model for context compression
+COMPRESS_MODEL = "gpt-4o-mini"
 
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CloudScaleEnv — openenv EnvClient subclass
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CloudScaleEnv(EnvClient):
+    """
+    Client for CloudScaleRL environments.
+
+    Maintains a persistent WebSocket connection to the environment server,
+    enabling efficient multi-step interactions with lower latency.
+    Follows the same pattern as DMControlEnv.
+
+    Supported tasks:
+        - task1_hpa      (easy)   : Reactive HPA, single service
+        - task2_cost     (medium) : Cost-aware multi-service
+        - task3_incident (hard)   : Multi-region incident response
+
+    Example:
+        >>> with CloudScaleEnv(base_url="http://localhost:8000") as env:
+        ...     result = env.reset(task_id="task1_hpa")
+        ...     print(result.observation.global_slo_met)
+        ...
+        ...     action = CloudScaleAction(
+        ...         hpa=HPAAction(service="api-gateway", target_replicas=5)
+        ...     )
+        ...     result = env.step(action)
+        ...     print(f"Reward: {result.reward:.3f}")
+
+    Example switching tasks (like dm_control switching domains):
+        >>> client = CloudScaleEnv(base_url="http://localhost:8000")
+        >>> result = client.reset(task_id="task1_hpa")
+        >>> # ... train on task 1 ...
+        >>> result = client.reset(task_id="task3_incident")
+        >>> # ... train on task 3 ...
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        connect_timeout_s: float = 10.0,
+        message_timeout_s: float = 60.0,
+        provider: Optional[Any] = None,
+    ) -> None:
+        super().__init__(
+            base_url=base_url,
+            connect_timeout_s=connect_timeout_s,
+            message_timeout_s=message_timeout_s,
+            provider=provider,
+        )
+
+    # ── openenv EnvClient interface ───────────────────────────────────────────
+
+    def _step_payload(self, action: CloudScaleAction) -> dict[str, Any]:
+        """
+        Convert CloudScaleAction → JSON payload for POST /step.
+        Mirrors DMControlEnv._step_payload().
+        """
+        return action.model_dump(exclude_none=True)
+
+    def _parse_result(
+        self, payload: dict[str, Any]
+    ) -> StepResult[CloudScaleObservation]:
+        """
+        Parse server JSON response → StepResult[CloudScaleObservation].
+        Mirrors DMControlEnv._parse_result().
+        """
+        obs_data = payload.get("observation", {})
+        observation = CloudScaleObservation(**obs_data)
+
+        return StepResult(
+            observation=observation,
+            reward=payload.get("reward"),
+            done=payload.get("done", False),
+        )
+
+    def _parse_state(self, payload: dict[str, Any]) -> CloudScaleState:
+        """
+        Parse GET /state response → CloudScaleState.
+        Mirrors DMControlEnv._parse_state().
+        """
+        return CloudScaleState(**payload)
+
+    # ── Public API (mirrors DMControlEnv.reset / step signatures) ─────────────
+
+    def reset(
+        self,
+        task_id: Optional[str] = None,
+        seed: Optional[int] = None,
+        render: bool = False,
+        **kwargs: Any,
+    ) -> StepResult[CloudScaleObservation]:
+        """
+        Reset the environment for a new episode.
+
+        Args:
+            task_id: Optionally switch to a different task
+                     (like switching domain_name in dm_control).
+            seed: Random seed for reproducibility.
+            render: If True, include JSON dashboard in observation.
+
+        Returns:
+            StepResult with initial CloudScaleObservation.
+        """
+        reset_kwargs = dict(kwargs)
+        if task_id is not None:
+            reset_kwargs["task_id"] = task_id
+        if seed is not None:
+            reset_kwargs["seed"] = seed
+        reset_kwargs["render"] = render
+        return super().reset(**reset_kwargs)
+
+    def step(
+        self,
+        action: CloudScaleAction,
+        render: bool = False,
+        **kwargs: Any,
+    ) -> StepResult[CloudScaleObservation]:
+        """
+        Execute one tick in the environment.
+
+        Args:
+            action: CloudScaleAction (hpa / vpa / traffic / node / no_op).
+            render: If True, include JSON dashboard in returned observation.
+
+        Returns:
+            StepResult with new observation, reward scalar, and done flag.
+        """
+        return super().step(action, render=render, **kwargs)
+
+    @staticmethod
+    def available_tasks() -> list[tuple[str, str, int, str]]:
+        """
+        List available CloudScaleRL tasks.
+        Mirrors DMControlEnv.available_environments().
+
+        Returns:
+            List of (task_id, difficulty, max_steps, description) tuples.
+        """
+        return AVAILABLE_TASKS
+
+    @classmethod
+    def from_direct(
+        cls,
+        task_id: str = "task1_hpa",
+        port: int = 8000,
+    ) -> "CloudScaleEnv":
+        """
+        Create a CloudScaleEnv client with an embedded local server.
+        Mirrors DMControlEnv.from_direct().
+
+        Starts a local uvicorn server in a subprocess and returns a client
+        connected to it. Useful for quick testing without Docker.
+
+        Args:
+            task_id: Default task to load.
+            port: Port for the local server.
+
+        Returns:
+            CloudScaleEnv client connected to the local server.
+
+        Example:
+            >>> client = CloudScaleEnv.from_direct(task_id="task3_incident")
+            >>> try:
+            ...     result = client.reset()
+            ...     for _ in range(100):
+            ...         result = client.step(CloudScaleAction(no_op=True))
+            ... finally:
+            ...     client.close()
+        """
+        import subprocess
+        import time
+
+        import requests as req_lib
+
+        cmd = [
+            sys.executable, "-m", "uvicorn",
+            "cloudscalerl.server.app:app",
+            "--host", "127.0.0.1",
+            "--port", str(port),
+        ]
+
+        env = {
+            **os.environ,
+            "NO_PROXY": "localhost,127.0.0.1",
+            "no_proxy": "localhost,127.0.0.1",
+        }
+
+        server_process = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        base_url = f"http://127.0.0.1:{port}"
+        for _ in range(30):
+            try:
+                r = req_lib.get(
+                    f"{base_url}/health", timeout=2,
+                    proxies={"http": None, "https": None},
+                )
+                if r.status_code == 200:
+                    break
+            except req_lib.exceptions.RequestException:
+                pass
+            time.sleep(1)
+        else:
+            server_process.kill()
+            raise RuntimeError(
+                f"Failed to start local CloudScaleRL server on port {port}."
+            )
+
+        class _DirectProvider:
+            def __init__(self, proc: subprocess.Popen) -> None:
+                self._proc = proc
+
+            def stop(self) -> None:
+                if self._proc:
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+
+        return cls(base_url=base_url, provider=_DirectProvider(server_process))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LLM Reasoning Layer
+# ═══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """
 You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
-Your job is to observe real-time cluster metrics each tick and decide scaling actions.
+Your job: observe real-time cluster metrics each tick, reason about risks, and
+output a scaling action. You are the agent in a CloudScaleRL environment.
 
-=== TIMING RULES (CRITICAL) ===
+=== TIMING (CRITICAL) ===
 - Each tick = 60 seconds of simulated time.
-- Pod scheduling takes 2 ticks to take effect. You must PRE-SCALE before traffic arrives.
-- Node provisioning takes 5 ticks. Plan node changes well in advance.
-- Pod startup adds ~45s latency (±10s). Factor this into latency decisions.
+- Pod scheduling takes 2 ticks. PRE-SCALE before traffic arrives.
+- Node provisioning takes 5 ticks. Plan node changes well ahead.
+- Pod startup adds ~45s latency. Factor this into latency decisions.
 
 === SLO RULES ===
 - NEVER let p99 latency exceed 200ms on any service.
-- NEVER let error_rate exceed 0.1% on any service.
-- If a region is marked DEGRADED, shift ALL traffic away from it immediately.
+- NEVER let error_rate exceed 0.1% (0.001 fraction).
+- If a region is marked DEGRADED, shift ALL traffic away immediately.
 
 === COST RULES ===
 - Never exceed budget_remaining. Over-provisioning wastes money.
-- Spot instances (spot.*) are 70% cheaper but can be preempted at any tick.
+- Spot instances are 70% cheaper but can be preempted at any tick.
 - Use VPA to right-size pods before adding nodes.
-- Prefer greener regions (lower carbon_intensity_gco2_kwh) when SLO and cost allow.
+- Prefer greener regions (lower carbon_intensity_gco2_kwh) when cost/SLO allow.
 
 === STABILITY RULES ===
-- Avoid thrashing: do not scale a service by more than 50% in 3 consecutive ticks.
-- Observe RECENT REWARDS: if rewards are trending down, your last action was wrong.
-- UPCOMING EVENTS in the observation tell you what is coming — act early.
+- Avoid thrashing: do not scale a service by >50% in 3 consecutive ticks.
+- Watch RECENT REWARDS — if trending down, your last action was wrong.
+- UPCOMING EVENTS show what is coming — act early (2 ticks ahead for pods).
 
 === OUTPUT FORMAT ===
 Think step by step:
-1. Identify the biggest risk right now (latency breach? cost overrun? region failure?)
+1. Identify the biggest risk (latency breach? cost overrun? region failure?)
 2. Decide what action addresses that risk without causing a new problem.
-3. Output a valid JSON object matching the Action schema. Raw JSON only — no markdown.
+3. Output ONLY a valid JSON object. No markdown, no preamble.
 
 ACTION SCHEMA:
 {
-  "hpa": {
-    "service": "<service_name>",
-    "target_replicas": <int|null>,
-    "min_replicas": <int|null>,
-    "max_replicas": <int|null>,
-    "target_cpu_utilization": <float 0.3–0.9|null>
-  } | null,
-  "vpa": {
-    "service": "<service_name>",
-    "cpu_request_millicores": <int|null>,
-    "memory_request_mb": <int|null>
-  } | null,
-  "traffic": {
-    "region_weights": {"<region_id>": <float>, ...} | null,
-    "failover_from": "<region_id>" | null,
-    "failover_to": "<region_id>" | null,
-    "canary_service": "<service>" | null,
-    "canary_percent": <float 0–1|null>
-  } | null,
-  "node": {
-    "region": "<region_id>",
-    "operation": "add" | "remove" | "change_type",
-    "node_type": "<type>" | null,
-    "count": <int>
-  } | null,
+  "hpa": {"service": str, "target_replicas": int|null, "min_replicas": int|null,
+          "max_replicas": int|null, "target_cpu_utilization": float|null} | null,
+  "vpa": {"service": str, "cpu_request_millicores": int|null,
+          "memory_request_mb": int|null} | null,
+  "traffic": {"region_weights": {region_id: float}|null,
+              "failover_from": str|null, "failover_to": str|null} | null,
+  "node": {"region": str, "operation": "add"|"remove"|"change_type",
+           "node_type": str|null, "count": int} | null,
   "no_op": false
 }
-
-All fields are optional. Set unused sub-actions to null. If waiting is correct, set no_op: true.
-region_weights must sum to 1.0 if provided.
+region_weights must sum to 1.0. Set no_op: true to explicitly wait.
 """
 
-# ── OpenAI Tool Definitions (used when USE_TOOLS=true) ───────────────────────
-
+# OpenAI tool definitions (USE_TOOLS=true mode)
 TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "scale_hpa",
-            "description": (
-                "Scale a service horizontally. Use when CPU > 75%, p99 is rising, "
-                "or a traffic spike is predicted within 2 ticks."
-            ),
+            "description": "Scale a service horizontally. Use when CPU > 75% or p99 is rising.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "service": {"type": "string", "description": "Service name to scale"},
-                    "target_replicas": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Absolute target replica count",
-                    },
+                    "service": {"type": "string"},
+                    "target_replicas": {"type": "integer", "minimum": 1, "maximum": 100},
                     "min_replicas": {"type": "integer", "minimum": 1},
                     "max_replicas": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "target_cpu_utilization": {
-                        "type": "number",
-                        "minimum": 0.3,
-                        "maximum": 0.9,
-                        "description": "Target CPU fraction for HPA autoscaler",
-                    },
+                    "target_cpu_utilization": {"type": "number", "minimum": 0.3, "maximum": 0.9},
                 },
                 "required": ["service"],
             },
@@ -151,24 +383,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "adjust_vpa",
-            "description": (
-                "Adjust vertical resource requests for a service. "
-                "Use when memory OOM kills occur or CPU throttling is observed."
-            ),
+            "description": "Adjust per-pod resource requests. Use when memory OOM or CPU throttled.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "service": {"type": "string"},
-                    "cpu_request_millicores": {
-                        "type": "integer",
-                        "minimum": 10,
-                        "maximum": 32000,
-                    },
-                    "memory_request_mb": {
-                        "type": "integer",
-                        "minimum": 64,
-                        "maximum": 131072,
-                    },
+                    "cpu_request_millicores": {"type": "integer", "minimum": 10, "maximum": 32000},
+                    "memory_request_mb": {"type": "integer", "minimum": 64, "maximum": 131072},
                 },
                 "required": ["service"],
             },
@@ -178,20 +399,16 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "reroute_traffic",
-            "description": (
-                "Shift traffic weights between regions. Weights must sum to 1.0. "
-                "Use when a region is degraded or for carbon-aware routing."
-            ),
+            "description": "Shift traffic weights between regions. Weights must sum to 1.0.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "region_weights": {
                         "type": "object",
                         "additionalProperties": {"type": "number"},
-                        "description": "Map of region_id -> traffic fraction. Must sum to 1.0.",
                     },
-                    "failover_from": {"type": "string", "description": "Region to drain"},
-                    "failover_to": {"type": "string", "description": "Region to receive traffic"},
+                    "failover_from": {"type": "string"},
+                    "failover_to": {"type": "string"},
                 },
             },
         },
@@ -200,22 +417,13 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "manage_nodes",
-            "description": (
-                "Add, remove, or change node types in a region. "
-                "Node provisioning takes 5 ticks — act early."
-            ),
+            "description": "Add/remove/change nodes. Node provisioning takes 5 ticks — act early.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "region": {"type": "string"},
-                    "operation": {
-                        "type": "string",
-                        "enum": ["add", "remove", "change_type"],
-                    },
-                    "node_type": {
-                        "type": "string",
-                        "description": 'e.g. "m5.large", "c5.xlarge", "spot.c5.xlarge"',
-                    },
+                    "operation": {"type": "string", "enum": ["add", "remove", "change_type"]},
+                    "node_type": {"type": "string"},
                     "count": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "required": ["region", "operation"],
@@ -226,7 +434,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "no_op",
-            "description": "Explicitly do nothing this tick. Use when the cluster is stable.",
+            "description": "Do nothing this tick. Use when the cluster is stable.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -238,121 +446,98 @@ TOOLS: list[dict[str, Any]] = [
 
 class ContextManager:
     """
-    Manages what goes into the LLM context each tick.
-    Keeps a rolling window of recent observations + a compressed episode summary.
-    Prevents context window overflow on long episodes (720 ticks for Task 2).
+    Manages LLM context across ticks.
+    Keeps a rolling 5-tick window of obs/action/reward history.
+    Compresses older history every 20 ticks to stay within token budget.
     """
 
     def __init__(self, window_size: int = 5, compress_after: int = 20) -> None:
         self.window_size = window_size
         self.compress_after = compress_after
-        self.history: list[dict[str, Any]] = []  # {obs_text, action_json, reward}
+        self.history: list[dict[str, Any]] = []
         self.episode_summary: str = ""
 
-    def add(self, obs_text: str, action: Action, reward: float) -> None:
-        self.history.append(
-            {
-                "obs": obs_text,
-                "action": action.model_dump_json(exclude_none=True),
-                "reward": round(reward, 4),
-            }
-        )
+    def add(self, obs_text: str, action: CloudScaleAction, reward: float) -> None:
+        self.history.append({
+            "obs": obs_text,
+            "action": action.model_dump_json(exclude_none=True),
+            "reward": round(reward, 4),
+        })
         if len(self.history) > self.compress_after:
             self._compress()
 
     def build_messages(self, current_obs_text: str) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
         if self.episode_summary:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"EPISODE CONTEXT SO FAR:\n{self.episode_summary}",
-                }
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "Understood. I'll use this context to inform my decisions.",
-                }
-            )
-
-        # Rolling window as alternating user/assistant turns
-        window = self.history[-self.window_size :]
-        for entry in window:
+            messages += [
+                {"role": "user", "content": f"EPISODE CONTEXT:\n{self.episode_summary}"},
+                {"role": "assistant", "content": "Understood. Using this context."},
+            ]
+        for entry in self.history[-self.window_size:]:
             messages.append({"role": "user", "content": entry["obs"]})
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"Action taken: {entry['action']}\n(Reward received: {entry['reward']})",
-                }
-            )
-
+            messages.append({
+                "role": "assistant",
+                "content": f"Action: {entry['action']}\nReward: {entry['reward']}",
+            })
         messages.append({"role": "user", "content": current_obs_text})
         return messages
 
     def _compress(self) -> None:
-        """
-        Ask a cheap model to summarise old history into a short narrative.
-        Called automatically when history grows beyond compress_after ticks.
-        """
         old = self.history[: -self.window_size]
-        summary_prompt = (
-            "Summarise the following Kubernetes cluster management decisions in 5 bullet points. "
-            "Focus on: what scaling actions were taken, what worked, what didn't, "
-            "reward trend, and current cluster state.\n\n"
+        prompt = (
+            "Summarise these Kubernetes cluster management decisions in 5 bullet points. "
+            "Focus on: actions taken, what worked, what didn't, reward trend, cluster state.\n\n"
             + "\n---\n".join(
-                f"Tick obs: {e['obs'][:300]}...\nAction: {e['action']}\nReward: {e['reward']}"
+                f"obs: {e['obs'][:250]}...\naction: {e['action']}\nreward: {e['reward']}"
                 for e in old
             )
         )
-        resp = client.chat.completions.create(
+        resp = openai_client.chat.completions.create(
             model=COMPRESS_MODEL,
-            messages=[{"role": "user", "content": summary_prompt}],
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
         )
-        new_summary = resp.choices[0].message.content or ""
-        if self.episode_summary:
-            self.episode_summary = (
-                f"{self.episode_summary}\n\n[LATER SUMMARY]\n{new_summary}"
-            )
-        else:
-            self.episode_summary = new_summary
-        self.history = self.history[-self.window_size :]
+        new_chunk = resp.choices[0].message.content or ""
+        self.episode_summary = (
+            f"{self.episode_summary}\n\n[LATER]\n{new_chunk}"
+            if self.episode_summary
+            else new_chunk
+        )
+        self.history = self.history[-self.window_size:]
         console.print("[dim]🗜  Context compressed[/dim]")
 
 
 # ── Observation → Prompt ──────────────────────────────────────────────────────
 
 
-def obs_to_prompt(obs: Observation, reward_history: list[float]) -> str:
+def obs_to_prompt(obs: CloudScaleObservation, reward_history: list[float]) -> str:
     lines = [
         f"=== Tick {obs.step} ===",
-        f"Budget remaining: ${obs.budget_remaining_usd:.2f}  |  Cost now: ${obs.total_cost_usd_per_hour:.2f}/hr",
+        f"Budget remaining: ${obs.budget_remaining_usd:.2f}  |  "
+        f"Cost now: ${obs.total_cost_usd_per_hour:.2f}/hr",
         f"Global SLO met: {obs.global_slo_met}",
     ]
 
     if obs.counterfactual_cost_usd_per_hour is not None:
         delta = obs.total_cost_usd_per_hour - obs.counterfactual_cost_usd_per_hour
         lines.append(
-            f"Oracle optimal cost: ${obs.counterfactual_cost_usd_per_hour:.2f}/hr  "
-            f"(you're {'over' if delta > 0 else 'under'} by ${abs(delta):.2f}/hr)"
+            f"Oracle cost: ${obs.counterfactual_cost_usd_per_hour:.2f}/hr  "
+            f"({'over' if delta > 0 else 'under'} by ${abs(delta):.2f}/hr)"
         )
 
     lines += ["", "SERVICES:"]
     for name, svc in obs.services.items():
         slo_ok = svc.p99_latency_ms < 200 and svc.error_rate < 0.001
-        slo_flag = "✅" if slo_ok else "⚠️ SLO BREACH"
+        flag = "✅" if slo_ok else "⚠️ SLO BREACH"
+        pending = f" (pending→{svc.pending_replicas})" if svc.pending_replicas else ""
         lines.append(
-            f"  {name} {slo_flag}"
-            f"\n    replicas={svc.replicas}"
-            + (f" (pending→{svc.pending_replicas})" if svc.pending_replicas else "")
-            + f"  cpu={svc.cpu_utilization:.0%}"
-            f"  mem={svc.memory_utilization:.0%}"
-            f"  p99={svc.p99_latency_ms:.0f}ms"
-            f"  rps={svc.requests_per_second:.1f}"
-            f"  errors={svc.error_rate:.4%}"
-            f"\n    cpu_req={svc.cpu_request_millicores}m  mem_req={svc.memory_request_mb}MB"
+            f"  {name} {flag}\n"
+            f"    replicas={svc.replicas}{pending}  cpu={svc.cpu_utilization:.0%}  "
+            f"mem={svc.memory_utilization:.0%}  p99={svc.p99_latency_ms:.0f}ms  "
+            f"rps={svc.requests_per_second:.1f}  errors={svc.error_rate:.4%}\n"
+            f"    cpu_req={svc.cpu_request_millicores}m  mem_req={svc.memory_request_mb}MB"
         )
 
     lines += ["", "REGIONS:"]
@@ -360,56 +545,47 @@ def obs_to_prompt(obs: Observation, reward_history: list[float]) -> str:
         status = "⚠️  DEGRADED" if r.is_degraded else "✅ healthy"
         spot = "  [SPOT]" if r.is_spot else ""
         lines.append(
-            f"  {rid} {status}{spot}"
-            f"\n    weight={r.traffic_weight:.0%}  nodes={r.node_count}"
-            f"  type={r.node_type}  cost=${r.cost_per_hour:.2f}/hr"
-            f"  carbon={r.carbon_intensity_gco2_kwh:.0f} gCO₂/kWh"
+            f"  {rid} {status}{spot}\n"
+            f"    weight={r.traffic_weight:.0%}  nodes={r.node_count}  "
+            f"type={r.node_type}  cost=${r.cost_per_hour:.2f}/hr  "
+            f"carbon={r.carbon_intensity_gco2_kwh:.0f} gCO₂/kWh"
         )
 
     if obs.pending_events:
-        lines += ["", f"⏰ UPCOMING EVENTS: {', '.join(obs.pending_events)}"]
+        lines += ["", f"⏰ UPCOMING: {', '.join(obs.pending_events)}"]
 
     if reward_history:
         recent = reward_history[-5:]
         trend = "↑" if len(recent) > 1 and recent[-1] > recent[0] else "↓"
-        lines += [
-            "",
-            f"📈 RECENT REWARDS: {[round(r, 3) for r in recent]}  (trend: {trend})",
-        ]
+        lines += ["", f"📈 RECENT REWARDS: {[round(r, 3) for r in recent]}  ({trend})"]
 
     lines += ["", "Think step by step, then output your JSON action."]
     return "\n".join(lines)
 
 
-# ── Action Parser ─────────────────────────────────────────────────────────────
+# ── Action Parsers ────────────────────────────────────────────────────────────
 
 
-def parse_action_from_json(raw: str, obs: Observation) -> Action:
-    """Parse LLM JSON output → validated Action. Falls back to no_op on error."""
+def parse_action_from_json(raw: str) -> CloudScaleAction:
     raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
-        data = json.loads(raw)
-        return Action(**data)
+        return CloudScaleAction(**json.loads(raw))
     except (json.JSONDecodeError, ValidationError) as e:
-        console.print(f"[yellow][WARN] Action parse failed: {e}. Using no_op.[/yellow]")
-        return Action(no_op=True)
+        console.print(f"[yellow][WARN] Parse failed: {e}. Using no_op.[/yellow]")
+        return CloudScaleAction(no_op=True)
 
 
-def parse_action_from_tools(tool_calls: list[Any]) -> Action:
-    """
-    Merge multiple tool calls (scale_hpa + reroute_traffic in same tick) → one Action.
-    This lets the agent do compound actions when using function calling mode.
-    """
-    hpa: HPAAction | None = None
-    vpa: VPAAction | None = None
-    traffic: TrafficAction | None = None
-    node: NodeAction | None = None
+def parse_action_from_tools(tool_calls: list[Any]) -> CloudScaleAction:
+    """Merge multiple tool calls into one CloudScaleAction (compound actions)."""
+    hpa: Optional[HPAAction] = None
+    vpa: Optional[VPAAction] = None
+    traffic: Optional[TrafficAction] = None
+    node: Optional[NodeAction] = None
     no_op = False
 
     for tc in tool_calls:
         name = tc.function.name
         args = json.loads(tc.function.arguments)
-
         if name == "scale_hpa":
             hpa = HPAAction(**args)
         elif name == "adjust_vpa":
@@ -423,8 +599,7 @@ def parse_action_from_tools(tool_calls: list[Any]) -> Action:
 
     if not any([hpa, vpa, traffic, node]):
         no_op = True
-
-    return Action(hpa=hpa, vpa=vpa, traffic=traffic, node=node, no_op=no_op)
+    return CloudScaleAction(hpa=hpa, vpa=vpa, traffic=traffic, node=node, no_op=no_op)
 
 
 # ── Main Agent Loop ───────────────────────────────────────────────────────────
@@ -435,17 +610,18 @@ def run_episode(
     task_id: str,
     model: str = DEFAULT_MODEL,
 ) -> dict[str, Any]:
-    """Run one full episode using the LLM reasoning agent."""
-    ctx = ContextManager(window_size=5, compress_after=20)
+    """Run one full episode using the LLM reasoning agent + CloudScaleEnv client."""
+    ctx = ContextManager()
     reward_history: list[float] = []
 
-    console.print(Panel(f"[bold cyan]CloudScaleRL Agent[/bold cyan]\nTask: [yellow]{task_id}[/yellow]  Model: {model}  Tools: {USE_TOOLS}"))
+    console.print(Panel(
+        f"[bold cyan]CloudScaleRL Agent[/bold cyan]\n"
+        f"Task: [yellow]{task_id}[/yellow]  Model: {model}  Tools: {USE_TOOLS}"
+    ))
 
-    # Reset environment
-    with httpx.Client(timeout=30.0) as http:
-        resp = http.post(f"{env_url}/reset", json={"task_id": task_id})
-        resp.raise_for_status()
-        obs = Observation(**resp.json())
+    with CloudScaleEnv(base_url=env_url) as env:
+        result = env.reset(task_id=task_id)
+        obs: CloudScaleObservation = result.observation
 
         total_reward = 0.0
         done = False
@@ -453,14 +629,11 @@ def run_episode(
 
         while not done:
             t0 = time.time()
-
-            # Build prompt
             obs_text = obs_to_prompt(obs, reward_history)
             messages = ctx.build_messages(obs_text)
 
-            # LLM inference
             if USE_TOOLS:
-                completion = client.chat.completions.create(
+                completion = openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
                     tools=TOOLS,
@@ -469,13 +642,13 @@ def run_episode(
                     temperature=0.15,
                 )
                 msg = completion.choices[0].message
-                if msg.tool_calls:
-                    action = parse_action_from_tools(msg.tool_calls)
-                else:
-                    # Model chose not to call a tool — force no_op
-                    action = Action(no_op=True)
+                action = (
+                    parse_action_from_tools(msg.tool_calls)
+                    if msg.tool_calls
+                    else CloudScaleAction(no_op=True)
+                )
             else:
-                completion = client.chat.completions.create(
+                completion = openai_client.chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=512,
@@ -483,41 +656,29 @@ def run_episode(
                     response_format={"type": "json_object"},
                 )
                 raw = completion.choices[0].message.content or "{}"
-                action = parse_action_from_json(raw, obs)
+                action = parse_action_from_json(raw)
 
-            # Step environment
-            step_resp = http.post(
-                f"{env_url}/step",
-                json=action.model_dump(exclude_none=True),
-            )
-            step_resp.raise_for_status()
-            result = step_resp.json()
+            # Step via EnvClient
+            result = env.step(action)
+            obs = result.observation
+            reward = result.reward or 0.0
+            done = result.done
 
-            obs = Observation(**result["observation"])
-            reward = result["reward"]["total"]
-            done = result["done"]
-
-            # Update memory
             ctx.add(obs_text, action, reward)
             reward_history.append(reward)
             total_reward += reward
 
             elapsed = time.time() - t0
             step_times.append(elapsed)
-
-            # Live display
-            _print_tick(obs, action, reward, elapsed, completion.usage)  # type: ignore[arg-type]
+            _print_tick(obs, action, reward, elapsed, getattr(completion, "usage", None))
 
     mean_reward = total_reward / max(len(reward_history), 1)
-    console.print(
-        Panel(
-            f"[bold green]Episode complete[/bold green]\n"
-            f"Ticks: {len(reward_history)}  "
-            f"Total reward: {total_reward:.3f}  "
-            f"Mean reward: {mean_reward:.3f}\n"
-            f"Avg step time: {sum(step_times)/len(step_times):.2f}s"
-        )
-    )
+    console.print(Panel(
+        f"[bold green]Episode complete[/bold green]\n"
+        f"Ticks: {len(reward_history)}  "
+        f"Total: {total_reward:.3f}  Mean: {mean_reward:.4f}\n"
+        f"Avg step: {sum(step_times)/len(step_times):.2f}s"
+    ))
     return {
         "task_id": task_id,
         "total_reward": total_reward,
@@ -527,42 +688,22 @@ def run_episode(
 
 
 def _print_tick(
-    obs: Observation,
-    action: Action,
+    obs: CloudScaleObservation,
+    action: CloudScaleAction,
     reward: float,
     elapsed: float,
     usage: Any,
 ) -> None:
-    """Pretty-print one tick summary to the console."""
     color = "green" if reward > 0 else "red"
     slo = "✅" if obs.global_slo_met else "⚠️ "
-    action_summary = action.model_dump_json(exclude_none=True, exclude={"no_op": False})
-
-    tokens = f"{usage.total_tokens}tok" if usage else ""
+    action_str = action.model_dump_json(exclude_none=True)
+    tok = f"{usage.total_tokens}tok" if usage else ""
     console.print(
         f"[dim]tick {obs.step:4d}[/dim]  "
-        f"slo={slo}  "
-        f"cost=${obs.total_cost_usd_per_hour:.2f}/hr  "
+        f"slo={slo}  cost=${obs.total_cost_usd_per_hour:.2f}/hr  "
         f"[{color}]reward={reward:+.3f}[/{color}]  "
-        f"[dim]{action_summary[:80]}  {elapsed:.1f}s {tokens}[/dim]"
+        f"[dim]{action_str[:80]}  {elapsed:.1f}s {tok}[/dim]"
     )
-
-
-def print_leaderboard(scores: list[dict[str, Any]]) -> None:
-    table = Table(title="CloudScaleRL Results")
-    table.add_column("Task", style="cyan")
-    table.add_column("Ticks", justify="right")
-    table.add_column("Mean Reward", justify="right")
-    table.add_column("Total Reward", justify="right")
-    for s in scores:
-        color = "green" if s["mean_reward"] > 0 else "red"
-        table.add_row(
-            s["task_id"],
-            str(s["ticks"]),
-            f"[{color}]{s['mean_reward']:+.4f}[/{color}]",
-            f"{s['total_reward']:.3f}",
-        )
-    console.print(table)
 
 
 def main() -> None:
@@ -572,11 +713,22 @@ def main() -> None:
 
     all_scores: list[dict[str, Any]] = []
     for task in tasks:
-        scores = run_episode(env_url, task, model=model)
-        all_scores.append(scores)
+        all_scores.append(run_episode(env_url, task, model=model))
 
     if len(all_scores) > 1:
-        print_leaderboard(all_scores)
+        table = Table(title="CloudScaleRL Results")
+        table.add_column("Task", style="cyan")
+        table.add_column("Ticks", justify="right")
+        table.add_column("Mean Reward", justify="right")
+        table.add_column("Total Reward", justify="right")
+        for s in all_scores:
+            c = "green" if s["mean_reward"] > 0 else "red"
+            table.add_row(
+                s["task_id"], str(s["ticks"]),
+                f"[{c}]{s['mean_reward']:+.4f}[/{c}]",
+                f"{s['total_reward']:.3f}",
+            )
+        console.print(table)
     else:
         console.print(f"\n[bold]Final score:[/bold] {all_scores[0]}")
 

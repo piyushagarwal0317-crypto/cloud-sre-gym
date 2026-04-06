@@ -16,8 +16,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from cloudscalerl.models import Action, Observation, Reward
-from server.cloudscalerl_environment import CloudScaleEnvironment
+from cloudscalerl.models import CloudScaleAction, CloudScaleObservation, CloudScaleReward
+from cloudscalerl.server.cloudscalerl_env import CloudScaleEnvServer
 
 # Load task configs from openenv.yaml
 _OPENENV_PATH = Path(__file__).parent.parent / "openenv.yaml"
@@ -35,7 +35,7 @@ app = FastAPI(
 )
 
 # One active environment instance per server process (single-agent use)
-_env: Optional[CloudScaleEnvironment] = None
+_env: Optional[CloudScaleEnvServer] = None
 
 
 # ── Request / Response Models ─────────────────────────────────────────────────
@@ -68,18 +68,17 @@ def reset(req: ResetRequest) -> dict[str, Any]:
         )
 
     config = TASK_CONFIGS[req.task_id]
-    _env = CloudScaleEnvironment(task_config=config, seed=req.seed)
-    obs = _env.reset()
+    _env = CloudScaleEnvServer()
+    obs = _env._reset(task_id=req.task_id, seed=req.seed)
     return obs.model_dump()
 
-
 @app.post("/step", response_model=StepResponse)
-def step(action: Action) -> StepResponse:
+def step(action: CloudScaleAction) -> StepResponse:
     """Advance the environment one tick with the given action."""
     if _env is None:
         raise HTTPException(status_code=400, detail="Environment not initialised. Call /reset first.")
 
-    obs, reward, done, info = _env.step(action)
+    obs, reward, done, info = _env._step(action)
 
     return StepResponse(
         observation=obs.model_dump(),
