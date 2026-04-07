@@ -56,6 +56,18 @@ class StepResponse(BaseModel):
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
+@app.get("/")
+def root() -> dict[str, Any]:
+    """Root route for Space health visibility and quick endpoint discovery."""
+    return {
+        "name": "CloudScaleRL",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+        "endpoints": ["/reset", "/step", "/state", "/render", "/tasks"],
+    }
+
+
 @app.post("/reset", response_model=dict[str, Any])
 def reset(req: ResetRequest) -> dict[str, Any]:
     """Reset the environment for a new episode."""
