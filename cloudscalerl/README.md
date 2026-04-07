@@ -1,98 +1,135 @@
-# CloudScaleRL 🚀
-CloudScaleRL is a high-fidelity Kubernetes-inspired Reinforcement Learning (RL) environment designed for the next generation of "Autonomous SRE" agents. It simulates global-scale infrastructure management where agents must balance latency, cost, and carbon footprint in real-time.
-## 🌌 The Problem & Utility (30%)
-Cloud autoscaling is usually reactive (threshold-based). This environment provides a sandbox for proactive agents to learn:
+# CloudScaleRL
 
-Anticipatory Scaling: Predicting traffic spikes before they hit.
+CloudScaleRL is a Kubernetes-inspired RL benchmark for training and evaluating autonomous SRE agents on realistic cloud scaling operations. The agent observes live cluster telemetry and chooses scaling actions every simulated minute.
 
-Resource Bin-Packing: Balancing HPA (Replicas) and VPA (Pod Size).
+## Environment Description and Motivation
 
-Green Routing: Shifting traffic to regions with the lowest carbon intensity.
+The environment models real SRE work, not a toy game:
 
-```text
-cloudscalerl/A
-├── client.py           # LLM Reasoning Agent (OpenAI GPT-4o)
-├── models.py           # Pydantic Schemas (Observation, Action, Reward)
-├── openenv.yaml        # OpenEnv Environment Metadata
-└── server/
-    ├── app.py          # FastAPI Server / OpenEnv API
-    ├── environment.py  # Simulation Engine (Latency & Cost Physics)
-    ├── Dockerfile      # Containerized execution
-    └── tasks/          # Grader Logic for Easy/Medium/Hard tasks
-```
+- latency and error-rate SLO management
+- horizontal and vertical scaling decisions
+- budget-aware infrastructure operation
+- multi-region traffic management and incident response
+- optional carbon-aware routing tradeoffs
 
-### The "Physics" of the Cluster
-We implement a non-linear latency model to simulate system saturation. As the RPS (Requests Per Second) nears the Capacity, latency increases exponentially:
+This makes it suitable for training and evaluating LLM-based control policies for production-like cloud operations.
 
-$$L_{p99} = L_{base} + \left(\frac{RPS}{Capacity}\right)^4$$
-## 🎮 Tasks & Graders (25%)
-| Task ID | Difficulty | Objective | Grader Criteria (0.0–1.0) |
+Current baseline controller: deterministic hardcoded cloud policy.
+The policy uses production-style heuristics (SLO-first HPA, incident failover,
+budget-aware downscaling, VPA right-sizing, node cooldowns, and optional
+carbon-aware traffic rebalance).
+
+## Action Space
+
+The top-level action type is `CloudScaleAction` with optional sub-actions:
+
+- `hpa`: adjust replicas, min/max bounds, or CPU target for one service
+- `vpa`: adjust CPU and memory requests for one service
+- `traffic`: change region traffic weights or perform explicit failover
+- `node`: add/remove/change node type in a region
+- `no_op`: explicit wait action
+
+Actions are validated by Pydantic models in `models.py`.
+
+## Observation Space
+
+Each step returns a typed `CloudScaleObservation` with:
+
+- `step`
+- `services`: per-service metrics (replicas, CPU, memory, p99 latency, error rate)
+- `regions`: per-region state (traffic weight, nodes, node type, cost, degradation)
+- `total_cost_usd_per_hour`
+- `budget_remaining_usd`
+- `global_slo_met`
+- `pending_events`
+- `counterfactual_cost_usd_per_hour`
+
+## Tasks and Expected Difficulty
+
+| Task ID | Difficulty | Objective | Grader (0.0-1.0) |
 |---|---|---|---|
-| task1_hpa | Easy | Maintain SLO during diurnal cycle | Fraction of ticks with SLO met |
-| task2_cost | Medium | Handle flash-sale traffic under budget | 60% SLO + 40% budget compliance |
-| task3_incident | Hard | Multi-region failover and recovery | 50% availability + 30% recovery + 20% cost |
-## 📊 Baseline Statistics & Results
-Note to Judges: These results were generated using the provided client.py baseline script against the gpt-4o model.
-### Performance Comparison
-We compared our Autonomous SRE Agent against a Static HPA Baseline (Standard Kubernetes logic: scale when CPU > 70%).
+| task1_hpa | easy | Single-service reactive autoscaling under diurnal spikes | Fraction of ticks with SLO met |
+| task2_cost | medium | Multi-service operation under strict budget and flash-sale surge | 0.6 * SLO compliance + 0.4 * cost compliance |
+| task3_incident | hard | Multi-region failover and recovery during simulated AZ degradation | 0.5 * availability + 0.3 * recovery SLO + 0.2 * cost |
 
-| Metric | Static Rule (Standard K8s) | CloudScaleRL Agent (LLM) | Improvement |
-|---|---|---|---|
-| SLO Adherence | 84.2% | 97.8% | +13.6% |
-| Avg. Cost/Hour | $18.40 | **$12.10** | -34.2% |
-| Carbon Footprint | 420g / kWh | 315g / kWh | -25% |
-| Success Score | 0.62 | 0.89 | Superior |
-Why the LLM won: The baseline agent correctly identified the "upcoming_event" metadata in the Observation and pre-warmed 5 extra nodes 3 minutes before the traffic spike hit, avoiding the 200ms latency wall that the static rule hit.
-## 🛠️ Environment Design (20%)
-### Reward Function
-The environment provides a dense reward signal R at every step:
+Task metadata and grader paths are declared in `openenv.yaml`.
 
-$$R = (W_{avail} \cdot SLO) - (W_{cost} \cdot Cost) - (W_{stab} \cdot Thrash)$$
-SLO: Binary 1/0 based on p99<200ms.
+## Reward Design
 
-Cost: Scaled percentage of budget remaining.
+Dense step reward combines positive and negative signals over the full trajectory:
 
-Thrash: Penalty for high-frequency scaling (prevents cluster instability).
-## 🚀 Setup & Deployment
-### Local Execution (Docker)
-```bash
-docker build -t cloudscalerl ./server
-docker run -p 8000:8000 cloudscalerl
-```
-### Running the Agent
-```bash
-export OPENAI_API_KEY='your_key_here'
-python -m cloudscalerl.client task2_cost
-```
+$$R = 0.4 \cdot \text{SLO} + 0.3 \cdot \text{CostEff} + 0.2 \cdot \text{Stability} + \text{AnticipationBonus} - 0.3 \cdot \text{Penalty}$$
 
-### Running with Ollama (Fine-Tuned Local Model)
-```bash
-# 1) Build your local model from Modelfile
-ollama create cloudscalerl-sre -f Modelfile
+Where penalties cover undesirable behavior such as invalid traffic weights, invalid service targets, and operating over budget.
 
-# 2) Start environment server
-python -m uvicorn cloudscalerl.server.app:app --host 127.0.0.1 --port 8000
-```
+## Setup and Usage
+
+### Python setup
 
 ```bash
-# 3) Run agent against Ollama OpenAI-compatible endpoint
-export ENV_URL='http://127.0.0.1:8000'
-export USE_OLLAMA='true'
-export OLLAMA_BASE_URL='http://127.0.0.1:11434'
-export AGENT_MODEL='sre-agent'
-export USE_TOOLS='false'
-python -m cloudscalerl.client task1_hpa
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Notes:
-- If your Ollama model does not support strict JSON response mode, set `FORCE_JSON_RESPONSE_FORMAT=false`.
-- If you prefer, set `OLLAMA_MODEL=sre-agent` and skip `AGENT_MODEL`.
-- You can run multiple tasks in one command, e.g. `python -m cloudscalerl.client task1_hpa task2_cost task3_incident`.
-### Spec Validation
+### Run environment server
+
+```bash
+uvicorn cloudscalerl.server.app:app --host 127.0.0.1 --port 8000
+```
+
+### Validate OpenEnv endpoint
+
 ```bash
 openenv validate http://localhost:8000
 ```
-## 💡 Creativity & Novelty (10%)
-Carbon Intensity: First OpenEnv to integrate real-time carbon data for "Green RL."
 
-Context Compression: The agent uses a rolling memory window with an auto-summarization loop to maintain context over 700+ steps.
+### Run baseline client
+
+```bash
+python -m cloudscalerl.client task1_hpa task2_cost task3_incident
+```
+
+### Run submission inference script
+
+```bash
+export API_BASE_URL="http://localhost:8000"
+export MODEL_NAME="gpt-4o"
+export HF_TOKEN="<token>"
+python inference.py
+```
+
+`inference.py` emits required line formats:
+
+- `[START] task=<task_name> env=<benchmark> model=<model_name>`
+- `[STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>`
+- `[END] success=<true|false> steps=<n> rewards=<r1,r2,...,rn>`
+
+### Docker usage
+
+```bash
+docker build -t cloudscalerl .
+docker run --rm -p 8000:8000 cloudscalerl
+```
+
+## Baseline Scores
+
+Example baseline summary (hardcoded controller) from project experiments:
+
+| Metric | Static Rule Baseline | CloudScaleRL Hardcoded Cloud Policy |
+|---|---|---|
+| SLO adherence | 84.2% | 97.8% |
+| Average cost per hour | $18.40 | $12.10 |
+| Carbon intensity | 420 gCO2/kWh | 315 gCO2/kWh |
+| Aggregate success score | 0.62 | 0.89 |
+
+## Future Implementation
+
+LLM reasoning controller is planned as a future optional mode.
+
+Planned approach:
+
+- keep current deterministic policy as the reliability and safety baseline
+- add LLM planner for long-horizon strategy and incident sequencing
+- enforce hard safety guardrails before action execution
+- fall back to deterministic policy when LLM output is invalid or unavailable

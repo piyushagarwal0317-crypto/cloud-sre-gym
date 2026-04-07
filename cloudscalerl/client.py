@@ -1,34 +1,23 @@
 """
-CloudScaleRL — LLM Reasoning Agent Client
-==========================================
-Mirrors the DMControlEnv client pattern:
-  - CloudScaleEnv extends EnvClient[CloudScaleAction, CloudScaleObservation, CloudScaleState]
-  - _step_payload()  converts CloudScaleAction → JSON dict for the server
-  - _parse_result()  converts server JSON → StepResult[CloudScaleObservation]
-  - _parse_state()   converts server JSON → CloudScaleState
+CloudScaleRL hardcoded controller client.
 
-On top of the openenv plumbing, this module adds the LLM reasoning layer:
-  - SYSTEM_PROMPT      : SRE rules and action schema
-  - ContextManager     : rolling 5-tick window + episode compression
-  - obs_to_prompt()    : formats CloudScaleObservation for the LLM
-  - parse_action_*()   : LLM output → validated CloudScaleAction
-  - run_episode()      : main agent loop using the EnvClient
+This module provides:
+    - openenv-compatible client wrappers
+    - an HTTP endpoint adapter for the FastAPI server
+    - a deterministic, cloud-like control policy used by run_episode()
 
 Usage:
-    python -m cloudscalerl.client task1_hpa
-    USE_TOOLS=true python -m cloudscalerl.client task3_incident
+        python -m cloudscalerl.client task1_hpa
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
-from openai import OpenAI
 from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
@@ -72,74 +61,7 @@ from cloudscalerl.models import (
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
 console = Console()
-
-
-def _resolve_base_url() -> Optional[str]:
-    explicit = os.environ.get("OPENAI_BASE_URL")
-    if explicit:
-        return explicit
-
-    if os.environ.get("USE_OLLAMA", "false").lower() == "true":
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        return ollama_url.rstrip("/") + "/v1"
-
-    return None
-
-
-_resolved_base_url = _resolve_base_url()
-_resolved_api_key = os.environ.get("OPENAI_API_KEY")
-if not _resolved_api_key and _resolved_base_url and "11434" in _resolved_base_url:
-    _resolved_api_key = "ollama"
-
-
-def _resolve_default_model() -> str:
-    explicit = os.environ.get("AGENT_MODEL")
-    if explicit:
-        return explicit
-
-    if os.environ.get("USE_OLLAMA", "false").lower() == "true":
-        return os.environ.get("OLLAMA_MODEL", "sre-agent")
-
-    return "gpt-4o"
-
-openai_client = OpenAI(
-    api_key=_resolved_api_key or "dummy_key_for_local_testing",
-    base_url=_resolved_base_url,  # Allows pointing to vLLM, Ollama, HuggingFace, etc.
-)
-USE_TOOLS = os.environ.get("USE_TOOLS", "false").lower() == "true"
-FORCE_JSON_RESPONSE_FORMAT = (
-    os.environ.get("FORCE_JSON_RESPONSE_FORMAT", "true").lower() == "true"
-)
-DEFAULT_MODEL = _resolve_default_model()
-COMPRESS_MODEL = "gpt-4o-mini"
-ENABLE_INTERNAL_FEEDBACK = os.environ.get("ENABLE_INTERNAL_FEEDBACK", "false").lower() == "true"
-FEEDBACK_MODEL = os.environ.get("FEEDBACK_MODEL", "tinyllama-sre-critic")
-FEEDBACK_TEMPERATURE = float(os.environ.get("FEEDBACK_TEMPERATURE", "0.0"))
-FEEDBACK_MAX_TOKENS = int(os.environ.get("FEEDBACK_MAX_TOKENS", "300"))
-
-FEEDBACK_SYSTEM_PROMPT = """
-You are an internal SRE action critic for CloudScaleRL.
-You will receive:
-- current cluster observation summary
-- the agent's proposed action
-- recent reward trend
-
-Your job is to either approve the action or provide a safer/better revised action.
-
-Return ONLY valid JSON with this schema:
-{
-    "accept": true|false,
-    "reason": "short reason",
-    "revised_action": {CloudScaleAction JSON} | null
-}
-
-Rules:
-- If action risks SLO breach (p99>=200ms or error_rate>=0.001), reject and revise.
-- If a region is DEGRADED and traffic remains there, reject and revise.
-- Avoid aggressive replica thrashing (>50% change repeatedly).
-- Prefer no_op when pending_replicas already indicates scaling is in flight.
-- revised_action must be valid for the CloudScaleAction schema.
-""".strip()
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "hardcoded-controller")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -431,400 +353,346 @@ class CloudScaleHTTPEndpoint:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LLM Reasoning Layer
-# ═══════════════════════════════════════════════════════════════════════════════
-
-SYSTEM_PROMPT = """
-You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
-Your job: observe real-time cluster metrics each tick, reason about risks, and
-output a scaling action. You are the agent in a CloudScaleRL environment.
-
-=== TIMING (CRITICAL) ===
-- Each tick = 60 seconds of simulated time.
-- Pod scheduling takes 2 ticks. PRE-SCALE before traffic arrives.
-- Node provisioning takes 5 ticks. Plan node changes well ahead.
-- Pod startup adds ~45s latency. Factor this into latency decisions.
-
-=== SLO RULES ===
-- NEVER let p99 latency exceed 200ms on any service.
-- NEVER let error_rate exceed 0.1% (0.001 fraction).
-- If a region is marked DEGRADED, shift ALL traffic away immediately.
-
-=== COST RULES ===
-- Never exceed budget_remaining. Over-provisioning wastes money.
-- Spot instances are 70% cheaper but can be preempted at any tick.
-- Use VPA to right-size pods before adding nodes.
-- Prefer greener regions (lower carbon_intensity_gco2_kwh) when cost/SLO allow.
-
-=== STABILITY RULES ===
-- Avoid thrashing: do not scale a service by >50% in 3 consecutive ticks.
-- Watch RECENT REWARDS — if trending down, your last action was wrong.
-- UPCOMING EVENTS show what is coming — act early (2 ticks ahead for pods).
-
-=== OUTPUT FORMAT ===
-Think step by step:
-1. Identify the biggest risk (latency breach? cost overrun? region failure?)
-2. Decide what action addresses that risk without causing a new problem.
-3. Output ONLY a valid JSON object. No markdown, no preamble.
-
-ACTION SCHEMA:
-{
-  "hpa": {"service": str, "target_replicas": int|null, "min_replicas": int|null,
-          "max_replicas": int|null, "target_cpu_utilization": float|null} | null,
-  "vpa": {"service": str, "cpu_request_millicores": int|null,
-          "memory_request_mb": int|null} | null,
-  "traffic": {"region_weights": {region_id: float}|null,
-              "failover_from": str|null, "failover_to": str|null} | null,
-  "node": {"region": str, "operation": "add"|"remove"|"change_type",
-           "node_type": str|null, "count": int} | null,
-  "no_op": false
-}
-region_weights must sum to 1.0. Set no_op: true to explicitly wait.
-"""
-
-# OpenAI tool definitions (USE_TOOLS=true mode)
-TOOLS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "scale_hpa",
-            "description": "Scale a service horizontally. Use when CPU > 75% or p99 is rising.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "service": {"type": "string"},
-                    "target_replicas": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "min_replicas": {"type": "integer", "minimum": 1},
-                    "max_replicas": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "target_cpu_utilization": {"type": "number", "minimum": 0.3, "maximum": 0.9},
-                },
-                "required": ["service"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "adjust_vpa",
-            "description": "Adjust per-pod resource requests. Use when memory OOM or CPU throttled.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "service": {"type": "string"},
-                    "cpu_request_millicores": {"type": "integer", "minimum": 10, "maximum": 32000},
-                    "memory_request_mb": {"type": "integer", "minimum": 64, "maximum": 131072},
-                },
-                "required": ["service"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "reroute_traffic",
-            "description": "Shift traffic weights between regions. Weights must sum to 1.0.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "region_weights": {
-                        "type": "object",
-                        "additionalProperties": {"type": "number"},
-                    },
-                    "failover_from": {"type": "string"},
-                    "failover_to": {"type": "string"},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_nodes",
-            "description": "Add/remove/change nodes. Node provisioning takes 5 ticks — act early.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "region": {"type": "string"},
-                    "operation": {"type": "string", "enum": ["add", "remove", "change_type"]},
-                    "node_type": {"type": "string"},
-                    "count": {"type": "integer", "minimum": 1, "maximum": 20},
-                },
-                "required": ["region", "operation"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "no_op",
-            "description": "Do nothing this tick. Use when the cluster is stable.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-]
-
-
-# ── Context Manager ───────────────────────────────────────────────────────────
-
-
-class ContextManager:
-    """
-    Manages LLM context across ticks.
-    Keeps a rolling 5-tick window of obs/action/reward history.
-    Compresses older history every 20 ticks to stay within token budget.
-    """
-
-    def __init__(self, window_size: int = 5, compress_after: int = 20) -> None:
-        self.window_size = window_size
-        self.compress_after = compress_after
-        self.history: list[dict[str, Any]] = []
-        self.episode_summary: str = ""
-
-    def add(self, obs_text: str, action: CloudScaleAction, reward: float) -> None:
-        self.history.append({
-            "obs": obs_text,
-            "action": action.model_dump_json(exclude_none=True),
-            "reward": round(reward, 4),
-        })
-        if len(self.history) > self.compress_after:
-            self._compress()
-
-    def build_messages(self, current_obs_text: str) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-        if self.episode_summary:
-            messages += [
-                {"role": "user", "content": f"EPISODE CONTEXT:\n{self.episode_summary}"},
-                {"role": "assistant", "content": "Understood. Using this context."},
-            ]
-        for entry in self.history[-self.window_size:]:
-            messages.append({"role": "user", "content": entry["obs"]})
-            messages.append({
-                "role": "assistant",
-                "content": f"Action: {entry['action']}\nReward: {entry['reward']}",
-            })
-        messages.append({"role": "user", "content": current_obs_text})
-        return messages
-
-    def _compress(self) -> None:
-        old = self.history[: -self.window_size]
-        prompt = (
-            "Summarise these Kubernetes cluster management decisions in 5 bullet points. "
-            "Focus on: actions taken, what worked, what didn't, reward trend, cluster state.\n\n"
-            + "\n---\n".join(
-                f"obs: {e['obs'][:250]}...\naction: {e['action']}\nreward: {e['reward']}"
-                for e in old
-            )
-        )
-        resp = openai_client.chat.completions.create(
-            model=COMPRESS_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-        )
-        new_chunk = resp.choices[0].message.content or ""
-        self.episode_summary = (
-            f"{self.episode_summary}\n\n[LATER]\n{new_chunk}"
-            if self.episode_summary
-            else new_chunk
-        )
-        self.history = self.history[-self.window_size:]
-        console.print("[dim]🗜  Context compressed[/dim]")
-
-
-# ── Observation → Prompt ──────────────────────────────────────────────────────
-
-
-def obs_to_prompt(obs: CloudScaleObservation, reward_history: list[float]) -> str:
-    lines = [
-        f"=== Tick {obs.step} ===",
-        f"Budget remaining: ${obs.budget_remaining_usd:.2f}  |  "
-        f"Cost now: ${obs.total_cost_usd_per_hour:.2f}/hr",
-        f"Global SLO met: {obs.global_slo_met}",
-    ]
-
-    if obs.counterfactual_cost_usd_per_hour is not None:
-        delta = obs.total_cost_usd_per_hour - obs.counterfactual_cost_usd_per_hour
-        lines.append(
-            f"Oracle cost: ${obs.counterfactual_cost_usd_per_hour:.2f}/hr  "
-            f"({'over' if delta > 0 else 'under'} by ${abs(delta):.2f}/hr)"
-        )
-
-    lines += ["", "SERVICES:"]
-    for name, svc in obs.services.items():
-        slo_ok = svc.p99_latency_ms < 200 and svc.error_rate < 0.001
-        flag = "✅" if slo_ok else "⚠️ SLO BREACH"
-        pending = f" (pending→{svc.pending_replicas})" if svc.pending_replicas else ""
-        lines.append(
-            f"  {name} {flag}\n"
-            f"    replicas={svc.replicas}{pending}  cpu={svc.cpu_utilization:.0%}  "
-            f"mem={svc.memory_utilization:.0%}  p99={svc.p99_latency_ms:.0f}ms  "
-            f"rps={svc.requests_per_second:.1f}  errors={svc.error_rate:.4%}\n"
-            f"    cpu_req={svc.cpu_request_millicores}m  mem_req={svc.memory_request_mb}MB"
-        )
-
-    lines += ["", "REGIONS:"]
-    for rid, r in obs.regions.items():
-        status = "⚠️  DEGRADED" if r.is_degraded else "✅ healthy"
-        spot = "  [SPOT]" if r.is_spot else ""
-        lines.append(
-            f"  {rid} {status}{spot}\n"
-            f"    weight={r.traffic_weight:.0%}  nodes={r.node_count}  "
-            f"type={r.node_type}  cost=${r.cost_per_hour:.2f}/hr  "
-            f"carbon={r.carbon_intensity_gco2_kwh:.0f} gCO₂/kWh"
-        )
-
-    if obs.pending_events:
-        lines += ["", f"⏰ UPCOMING: {', '.join(obs.pending_events)}"]
-
-    if reward_history:
-        recent = reward_history[-5:]
-        trend = "↑" if len(recent) > 1 and recent[-1] > recent[0] else "↓"
-        lines += ["", f"📈 RECENT REWARDS: {[round(r, 3) for r in recent]}  ({trend})"]
-
-    lines += ["", "Think step by step, then output your JSON action."]
-    return "\n".join(lines)
-
-
-# ── Action Parsers ────────────────────────────────────────────────────────────
-
-
-def parse_action_from_json(raw: str) -> CloudScaleAction:
-    raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    try:
-        return CloudScaleAction(**json.loads(raw))
-    except (json.JSONDecodeError, ValidationError) as e:
-        console.print(f"[yellow][WARN] Parse failed: {e}. Using no_op.[/yellow]")
-        return CloudScaleAction(no_op=True)
-
-
-def parse_action_from_tools(tool_calls: list[Any]) -> CloudScaleAction:
-    """Merge multiple tool calls into one CloudScaleAction (compound actions)."""
-    hpa: Optional[HPAAction] = None
-    vpa: Optional[VPAAction] = None
-    traffic: Optional[TrafficAction] = None
-    node: Optional[NodeAction] = None
-    no_op = False
-
-    for tc in tool_calls:
-        name = tc.function.name
-        args = json.loads(tc.function.arguments)
-        if name == "scale_hpa":
-            hpa = HPAAction(**args)
-        elif name == "adjust_vpa":
-            vpa = VPAAction(**args)
-        elif name == "reroute_traffic":
-            traffic = TrafficAction(**args)
-        elif name == "manage_nodes":
-            node = NodeAction(**args)
-        elif name == "no_op":
-            no_op = True
-
-    if not any([hpa, vpa, traffic, node]):
-        no_op = True
-    return CloudScaleAction(hpa=hpa, vpa=vpa, traffic=traffic, node=node, no_op=no_op)
-
-
-def _strip_markdown_fence(raw: str) -> str:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.removeprefix("```json").removeprefix("```")
-        if text.endswith("```"):
-            text = text[:-3]
-    return text.strip()
-
-
-def maybe_apply_internal_feedback(
-    obs: CloudScaleObservation,
-    proposed_action: CloudScaleAction,
-    reward_history: list[float],
-    model: str = FEEDBACK_MODEL,
-) -> tuple[CloudScaleAction, dict[str, Any]]:
-    """
-    Run a second-pass critic model over the proposed action.
-    If critic rejects and returns a valid revised_action, use it.
-    Otherwise keep original action.
-    """
-    prompt = (
-        f"OBSERVATION:\n{obs_to_prompt(obs, reward_history)}\n\n"
-        f"PROPOSED_ACTION:\n{proposed_action.model_dump_json(exclude_none=True)}\n\n"
-        "Respond with JSON only."
-    )
-
-    try:
-        completion = openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": FEEDBACK_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=FEEDBACK_TEMPERATURE,
-            max_tokens=FEEDBACK_MAX_TOKENS,
-        )
-
-        raw = completion.choices[0].message.content or "{}"
-        data = json.loads(_strip_markdown_fence(raw))
-
-        accepted = bool(data.get("accept", True))
-        reason = str(data.get("reason", "approved"))
-
-        if accepted:
-            return proposed_action, {
-                "enabled": True,
-                "accepted": True,
-                "reason": reason,
-                "model": model,
-            }
-
-        revised = data.get("revised_action")
-        if revised is None:
-            return proposed_action, {
-                "enabled": True,
-                "accepted": True,
-                "reason": f"critic_rejected_without_revision:{reason}",
-                "model": model,
-            }
-
-        revised_action = CloudScaleAction(**revised)
-        return revised_action, {
-            "enabled": True,
-            "accepted": False,
-            "reason": reason,
-            "model": model,
-        }
-
-    except Exception as exc:
-        console.print(
-            f"[yellow][WARN] Internal feedback unavailable: {exc}. Using original action.[/yellow]"
-        )
-        return proposed_action, {
-            "enabled": True,
-            "accepted": True,
-            "reason": "feedback_unavailable",
-            "model": model,
-        }
-
-
 # ── Main Agent Loop ───────────────────────────────────────────────────────────
+
+
+def _parse_t_plus(event: str) -> Optional[int]:
+    if "_t+" not in event:
+        return None
+    try:
+        return int(event.rsplit("_t+", 1)[1])
+    except ValueError:
+        return None
+
+
+def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
+    clean = {k: max(0.0, float(v)) for k, v in weights.items()}
+    total = sum(clean.values())
+    if total <= 0:
+        n = max(len(clean), 1)
+        equal = 1.0 / n
+        return {k: equal for k in clean}
+    normalized = {k: v / total for k, v in clean.items()}
+    anchor = max(normalized, key=normalized.get)
+    normalized[anchor] += 1.0 - sum(normalized.values())
+    return normalized
+
+
+def _budget_pressure(obs: CloudScaleObservation) -> bool:
+    return obs.budget_remaining_usd <= max(2.0 * obs.total_cost_usd_per_hour, 10.0)
+
+
+def _budget_critical(obs: CloudScaleObservation) -> bool:
+    return obs.budget_remaining_usd <= max(obs.total_cost_usd_per_hour, 5.0)
+
+
+def _decrement_policy_state(policy_state: dict[str, Any]) -> None:
+    for key in ("hpa_cooldowns", "vpa_cooldowns"):
+        cooldowns: dict[str, int] = policy_state[key]
+        for name in list(cooldowns.keys()):
+            cooldowns[name] -= 1
+            if cooldowns[name] <= 0:
+                cooldowns.pop(name, None)
+    policy_state["traffic_cooldown"] = max(0, int(policy_state["traffic_cooldown"]) - 1)
+    policy_state["node_cooldown"] = max(0, int(policy_state["node_cooldown"]) - 1)
+
+
+def _choose_hardcoded_action(
+    obs: CloudScaleObservation,
+    task_id: str,
+    policy_state: dict[str, Any],
+) -> tuple[CloudScaleAction, Optional[str], str]:
+    """
+    Deterministic cloud-like control policy.
+
+    Priority order:
+      1) traffic failover for degraded or imminent incident regions
+      2) SLO-protecting HPA scale-up (with cooldown)
+      3) budget-aware HPA scale-down
+      4) VPA right-sizing for sustained pressure or budget protection
+      5) node add/remove with conservative cooldown
+      6) optional carbon-aware traffic rebalance when stable
+      7) no-op
+    """
+    _decrement_policy_state(policy_state)
+    hpa_cooldowns: dict[str, int] = policy_state["hpa_cooldowns"]
+    vpa_cooldowns: dict[str, int] = policy_state["vpa_cooldowns"]
+
+    try:
+        spike_soon = any(
+            event.startswith("traffic_spike_t+") and (_parse_t_plus(event) or 99) <= 2
+            for event in obs.pending_events
+        )
+
+        degraded_regions = [rid for rid, r in obs.regions.items() if r.is_degraded]
+        upcoming_avoid: set[str] = set(degraded_regions)
+        for event in obs.pending_events:
+            if not event.startswith("az_degradation_"):
+                continue
+            ticks = _parse_t_plus(event)
+            if ticks is None or ticks > 2:
+                continue
+            parts = event.split("_")
+            if len(parts) >= 4:
+                region_id = parts[2]
+                if region_id in obs.regions and obs.regions[region_id].traffic_weight > 0.15:
+                    upcoming_avoid.add(region_id)
+
+        if upcoming_avoid and policy_state["traffic_cooldown"] == 0:
+            healthy = {
+                rid: r for rid, r in obs.regions.items() if rid not in upcoming_avoid
+            }
+            if healthy:
+                score = {
+                    rid: ((r.node_count + 1.0) / max(r.cost_per_hour, 0.1))
+                    + (180.0 / max(r.carbon_intensity_gco2_kwh, 80.0))
+                    for rid, r in healthy.items()
+                }
+                weights = {rid: 0.0 for rid in obs.regions}
+                for rid, val in _normalize_weights(score).items():
+                    weights[rid] = val
+                policy_state["traffic_cooldown"] = 3
+                return (
+                    CloudScaleAction(
+                        traffic=TrafficAction(region_weights=_normalize_weights(weights))
+                    ),
+                    None,
+                    "traffic_failover",
+                )
+
+        hottest_name: Optional[str] = None
+        hottest_score = 0.0
+        hottest_metrics = None
+        for svc_name, svc in obs.services.items():
+            if svc.pending_replicas is not None:
+                continue
+            if hpa_cooldowns.get(svc_name, 0) > 0:
+                continue
+            risk = max(
+                svc.cpu_utilization / 0.75,
+                svc.p99_latency_ms / 200.0,
+                svc.error_rate / 0.001,
+            )
+            if risk > hottest_score:
+                hottest_name = svc_name
+                hottest_score = risk
+                hottest_metrics = svc
+
+        if hottest_name is not None and hottest_metrics is not None:
+            urgent = hottest_score >= 1.0
+            proactive = spike_soon and hottest_score >= 0.85
+            if urgent or proactive:
+                demand_factor = max(
+                    hottest_metrics.cpu_utilization / 0.65,
+                    hottest_metrics.p99_latency_ms / 170.0,
+                    1.0 + min(1.0, hottest_metrics.error_rate / 0.001) * 0.25,
+                )
+                target = max(
+                    hottest_metrics.replicas + 1,
+                    int(hottest_metrics.replicas * demand_factor),
+                )
+                if proactive:
+                    target += 1
+                target = min(100, min(target, hottest_metrics.replicas + 4))
+                hpa_cooldowns[hottest_name] = 2
+                return (
+                    CloudScaleAction(
+                        hpa=HPAAction(
+                            service=hottest_name,
+                            target_replicas=target,
+                            target_cpu_utilization=0.65,
+                        )
+                    ),
+                    None,
+                    "hpa_scale_up",
+                )
+
+        if _budget_pressure(obs):
+            cool_candidates = []
+            for svc_name, svc in obs.services.items():
+                if svc.replicas <= 1 or svc.pending_replicas is not None:
+                    continue
+                if hpa_cooldowns.get(svc_name, 0) > 0:
+                    continue
+                if (
+                    svc.p99_latency_ms < 130
+                    and svc.error_rate < 0.0007
+                    and svc.cpu_utilization < 0.45
+                ):
+                    cool_candidates.append((svc_name, svc))
+            if cool_candidates:
+                cool_candidates.sort(
+                    key=lambda item: (item[1].cpu_utilization, item[1].p99_latency_ms)
+                )
+                svc_name, svc = cool_candidates[0]
+                step_down = 2 if _budget_critical(obs) and svc.replicas > 3 else 1
+                target = max(1, svc.replicas - step_down)
+                hpa_cooldowns[svc_name] = 3
+                return (
+                    CloudScaleAction(hpa=HPAAction(service=svc_name, target_replicas=target)),
+                    None,
+                    "budget_scale_down",
+                )
+
+        for svc_name, svc in sorted(
+            obs.services.items(),
+            key=lambda item: item[1].memory_utilization,
+            reverse=True,
+        ):
+            if svc.pending_replicas is not None:
+                continue
+            if vpa_cooldowns.get(svc_name, 0) > 0:
+                continue
+
+            if svc.memory_utilization > 0.85 or svc.cpu_utilization > 0.85:
+                new_cpu = (
+                    int(svc.cpu_request_millicores * 1.15)
+                    if svc.cpu_utilization > 0.85
+                    else svc.cpu_request_millicores
+                )
+                new_mem = (
+                    int(svc.memory_request_mb * 1.20)
+                    if svc.memory_utilization > 0.85
+                    else svc.memory_request_mb
+                )
+                vpa_cooldowns[svc_name] = 8
+                return (
+                    CloudScaleAction(
+                        vpa=VPAAction(
+                            service=svc_name,
+                            cpu_request_millicores=new_cpu,
+                            memory_request_mb=new_mem,
+                        )
+                    ),
+                    None,
+                    "vpa_tune_up",
+                )
+
+            if _budget_pressure(obs) and svc.cpu_utilization < 0.35 and svc.memory_utilization < 0.45:
+                new_cpu = max(250, int(svc.cpu_request_millicores * 0.90))
+                new_mem = max(256, int(svc.memory_request_mb * 0.90))
+                if new_cpu != svc.cpu_request_millicores or new_mem != svc.memory_request_mb:
+                    vpa_cooldowns[svc_name] = 8
+                    return (
+                        CloudScaleAction(
+                            vpa=VPAAction(
+                                service=svc_name,
+                                cpu_request_millicores=new_cpu,
+                                memory_request_mb=new_mem,
+                            )
+                        ),
+                        None,
+                        "vpa_tune_down",
+                    )
+
+        if policy_state["node_cooldown"] == 0 and obs.services:
+            avg_cpu = sum(s.cpu_utilization for s in obs.services.values()) / len(obs.services)
+            healthy_regions = [rid for rid, r in obs.regions.items() if not r.is_degraded]
+
+            if avg_cpu > 0.86 and not _budget_critical(obs) and healthy_regions:
+                target_region = max(healthy_regions, key=lambda rid: obs.regions[rid].traffic_weight)
+                node_type = obs.regions[target_region].node_type
+                if _budget_pressure(obs) and not node_type.startswith("spot."):
+                    node_type = "spot.c5.xlarge"
+                policy_state["node_cooldown"] = 5
+                return (
+                    CloudScaleAction(
+                        node=NodeAction(
+                            region=target_region,
+                            operation="add",
+                            node_type=node_type,
+                            count=1,
+                        )
+                    ),
+                    None,
+                    "node_scale_up",
+                )
+
+            if _budget_critical(obs) and avg_cpu < 0.55:
+                candidates = [
+                    rid
+                    for rid, r in obs.regions.items()
+                    if not r.is_degraded and r.node_count > 1 and r.traffic_weight < 0.70
+                ]
+                if candidates:
+                    target_region = max(candidates, key=lambda rid: obs.regions[rid].cost_per_hour)
+                    policy_state["node_cooldown"] = 5
+                    return (
+                        CloudScaleAction(
+                            node=NodeAction(region=target_region, operation="remove", count=1)
+                        ),
+                        None,
+                        "node_scale_down",
+                    )
+
+        if (
+            policy_state["traffic_cooldown"] == 0
+            and obs.global_slo_met
+            and len(obs.regions) >= 2
+            and not any(r.is_degraded for r in obs.regions.values())
+        ):
+            source = max(
+                obs.regions,
+                key=lambda rid: (
+                    obs.regions[rid].carbon_intensity_gco2_kwh
+                    * obs.regions[rid].traffic_weight
+                ),
+            )
+            target = min(
+                obs.regions,
+                key=lambda rid: obs.regions[rid].carbon_intensity_gco2_kwh,
+            )
+            carbon_gap = (
+                obs.regions[source].carbon_intensity_gco2_kwh
+                - obs.regions[target].carbon_intensity_gco2_kwh
+            )
+            if source != target and obs.regions[source].traffic_weight > 0.30 and carbon_gap > 150:
+                shift = min(0.15, obs.regions[source].traffic_weight - 0.20)
+                if shift > 0:
+                    weights = {rid: r.traffic_weight for rid, r in obs.regions.items()}
+                    weights[source] -= shift
+                    weights[target] += shift
+                    policy_state["traffic_cooldown"] = 4
+                    return (
+                        CloudScaleAction(
+                            traffic=TrafficAction(region_weights=_normalize_weights(weights))
+                        ),
+                        None,
+                        "carbon_rebalance",
+                    )
+
+        return CloudScaleAction(no_op=True), None, "steady_noop"
+    except (ValidationError, ValueError, TypeError) as exc:
+        return CloudScaleAction(no_op=True), str(exc), "policy_fallback_noop"
 
 
 def run_episode(
     env_url: str,
     task_id: str,
     model: str = DEFAULT_MODEL,
+    seed: int = 42,
+    emit_console: bool = True,
+    temperature: float = 0.15,
+    on_step: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
-    """Run one full episode using the LLM reasoning agent + CloudScaleEnv client."""
-    ctx = ContextManager()
+    """Run one full episode using deterministic hardcoded cloud controller."""
+    _ = model, temperature
     reward_history: list[float] = []
+    policy_state: dict[str, Any] = {
+        "hpa_cooldowns": {},
+        "vpa_cooldowns": {},
+        "traffic_cooldown": 0,
+        "node_cooldown": 0,
+    }
 
-    console.print(Panel(
-        f"[bold cyan]CloudScaleRL Agent[/bold cyan]\n"
-        f"Task: [yellow]{task_id}[/yellow]  Model: {model}  Tools: {USE_TOOLS}"
-    ))
+    if emit_console:
+        console.print(Panel(
+            f"[bold cyan]CloudScaleRL Hardcoded Controller[/bold cyan]\n"
+            f"Task: [yellow]{task_id}[/yellow]  Policy: deterministic-real-cloud"
+        ))
 
     with CloudScaleHTTPEndpoint(base_url=env_url) as env:
-        result = env.reset(task_id=task_id)
+        result = env.reset(task_id=task_id, seed=seed)
         obs: CloudScaleObservation = result.observation
 
         total_reward = 0.0
@@ -833,47 +701,11 @@ def run_episode(
 
         while not done:
             t0 = time.time()
-            obs_text = obs_to_prompt(obs, reward_history)
-            messages = ctx.build_messages(obs_text)
-            feedback_meta: Optional[dict[str, Any]] = None
-
-            if USE_TOOLS:
-                completion = openai_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    max_tokens=512,
-                    temperature=0.15,
-                )
-                msg = completion.choices[0].message
-                action = (
-                    parse_action_from_tools(msg.tool_calls)
-                    if msg.tool_calls
-                    else CloudScaleAction(no_op=True)
-                )
-            else:
-                completion_kwargs: dict[str, Any] = {
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": 512,
-                    "temperature": 0.15,
-                }
-                if FORCE_JSON_RESPONSE_FORMAT:
-                    completion_kwargs["response_format"] = {"type": "json_object"}
-
-                completion = openai_client.chat.completions.create(
-                    **completion_kwargs,
-                )
-                raw = completion.choices[0].message.content or "{}"
-                action = parse_action_from_json(raw)
-
-            if ENABLE_INTERNAL_FEEDBACK:
-                action, feedback_meta = maybe_apply_internal_feedback(
-                    obs=obs,
-                    proposed_action=action,
-                    reward_history=reward_history,
-                )
+            action, action_error, policy_reason = _choose_hardcoded_action(
+                obs,
+                task_id,
+                policy_state,
+            )
 
             # Step via EnvClient
             result = env.step(action)
@@ -881,33 +713,46 @@ def run_episode(
             reward = result.reward or 0.0
             done = result.done
 
-            ctx.add(obs_text, action, reward)
             reward_history.append(reward)
             total_reward += reward
 
             elapsed = time.time() - t0
             step_times.append(elapsed)
-            _print_tick(
-                obs,
-                action,
-                reward,
-                elapsed,
-                getattr(completion, "usage", None),
-                feedback_meta,
-            )
+            if emit_console:
+                _print_tick(
+                    obs,
+                    action,
+                    reward,
+                    elapsed,
+                    policy_reason=policy_reason,
+                )
+
+            if on_step is not None:
+                on_step(
+                    {
+                        "step": len(reward_history),
+                        "action": action.model_dump_json(exclude_none=True),
+                        "reward": reward,
+                        "done": done,
+                        "error": action_error,
+                    }
+                )
 
     mean_reward = total_reward / max(len(reward_history), 1)
-    console.print(Panel(
-        f"[bold green]Episode complete[/bold green]\n"
-        f"Ticks: {len(reward_history)}  "
-        f"Total: {total_reward:.3f}  Mean: {mean_reward:.4f}\n"
-        f"Avg step: {sum(step_times)/len(step_times):.2f}s"
-    ))
+    if emit_console:
+        console.print(Panel(
+            f"[bold green]Episode complete[/bold green]\n"
+            f"Ticks: {len(reward_history)}  "
+            f"Total: {total_reward:.3f}  Mean: {mean_reward:.4f}\n"
+            f"Avg step: {sum(step_times)/len(step_times):.2f}s"
+        ))
     return {
         "task_id": task_id,
         "total_reward": total_reward,
         "mean_reward": mean_reward,
         "ticks": len(reward_history),
+        "rewards": reward_history,
+        "success": bool(done and len(reward_history) > 0),
     }
 
 
@@ -916,24 +761,17 @@ def _print_tick(
     action: CloudScaleAction,
     reward: float,
     elapsed: float,
-    usage: Any,
-    feedback_meta: Optional[dict[str, Any]] = None,
+    policy_reason: Optional[str] = None,
 ) -> None:
     color = "green" if reward > 0 else "red"
     slo = "✅" if obs.global_slo_met else "⚠️ "
     action_str = action.model_dump_json(exclude_none=True)
-    tok = f"{usage.total_tokens}tok" if usage else ""
-    feedback_str = ""
-    if feedback_meta and feedback_meta.get("enabled"):
-        if feedback_meta.get("accepted"):
-            feedback_str = "critic=approved"
-        else:
-            feedback_str = "critic=rewrote"
+    policy_str = f"policy={policy_reason}" if policy_reason else ""
     console.print(
         f"[dim]tick {obs.step:4d}[/dim]  "
         f"slo={slo}  cost=${obs.total_cost_usd_per_hour:.2f}/hr  "
         f"[{color}]reward={reward:+.3f}[/{color}]  "
-        f"[dim]{action_str[:80]}  {elapsed:.1f}s {tok} {feedback_str}[/dim]"
+        f"[dim]{action_str[:80]}  {elapsed:.1f}s {policy_str}[/dim]"
     )
 
 
