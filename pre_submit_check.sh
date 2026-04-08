@@ -16,6 +16,8 @@ Defaults:
   API_BASE_URL               http://127.0.0.1:8000
   MODEL_NAME                 hardcoded-controller
   AUTO_START_SERVER          true
+  CHECK_API_ENDPOINTS        true   (validate /tasks, /metadata, /schema)
+  CHECK_MCP                  auto   (probe /mcp initialize; fail only when true)
   RUN_OPENENV_VALIDATE       auto   (run only if openenv CLI is available)
   RUN_DOCKER_BUILD           false
   PYTHON_BIN                 ./.venv/bin/python
@@ -23,6 +25,7 @@ Defaults:
 Examples:
   HF_TOKEN=abc ./pre_submit_check.sh
   HF_TOKEN=abc ./pre_submit_check.sh task1_hpa
+  HF_TOKEN=abc CHECK_MCP=true ./pre_submit_check.sh task1_hpa
   HF_TOKEN=abc RUN_OPENENV_VALIDATE=true RUN_DOCKER_BUILD=true ./pre_submit_check.sh
   ./pre_submit_check.sh --print-hf-space-settings
 EOF
@@ -61,6 +64,8 @@ MODEL_NAME="${MODEL_NAME:-hardcoded-controller}"
 AUTO_START_SERVER="${AUTO_START_SERVER:-true}"
 RUN_OPENENV_VALIDATE="${RUN_OPENENV_VALIDATE:-auto}"
 RUN_DOCKER_BUILD="${RUN_DOCKER_BUILD:-false}"
+CHECK_API_ENDPOINTS="${CHECK_API_ENDPOINTS:-true}"
+CHECK_MCP="${CHECK_MCP:-auto}"
 HEALTH_RETRIES="${HEALTH_RETRIES:-40}"
 HEALTH_DELAY_S="${HEALTH_DELAY_S:-1}"
 
@@ -104,6 +109,35 @@ require_pattern() {
     echo "[FAIL] ${description}"
     exit 1
   fi
+}
+
+probe_mcp_initialize() {
+  local mcp_url="${API_BASE_URL%/}/mcp"
+  local mcp_payload='{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}'
+  local mcp_body
+
+  if ! mcp_body="$(curl -fsS -X POST "${mcp_url}" -H "Content-Type: application/json" -d "${mcp_payload}")"; then
+    return 1
+  fi
+
+  "${PYTHON_BIN}" - "${mcp_body}" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("jsonrpc") != "2.0":
+    raise SystemExit(1)
+
+result = payload.get("result")
+if not isinstance(result, dict):
+    raise SystemExit(1)
+
+server_info = result.get("serverInfo")
+if not isinstance(server_info, dict) or not server_info.get("name"):
+    raise SystemExit(1)
+
+print("[PASS] MCP initialize endpoint is valid")
+PY
 }
 
 echo "[INFO] Checking static submission contract in inference.py"
@@ -173,6 +207,82 @@ else
   echo "[FAIL] Server not reachable at ${API_BASE_URL} and AUTO_START_SERVER=false"
   exit 1
 fi
+
+if [[ "${CHECK_API_ENDPOINTS}" == "true" ]]; then
+  echo "[INFO] Validating API discovery endpoints"
+  tasks_payload="$(curl -fsS "${API_BASE_URL%/}/tasks")"
+  metadata_payload="$(curl -fsS "${API_BASE_URL%/}/metadata")"
+  schema_payload="$(curl -fsS "${API_BASE_URL%/}/schema")"
+
+  if ! "${PYTHON_BIN}" - "${tasks_payload}" "${metadata_payload}" "${schema_payload}" <<'PY'
+import json
+import sys
+
+tasks = json.loads(sys.argv[1])
+metadata = json.loads(sys.argv[2])
+schema = json.loads(sys.argv[3])
+
+errors = []
+
+if not isinstance(tasks, list) or not tasks:
+    errors.append("/tasks must return a non-empty list")
+else:
+    required_task_keys = {"id", "name", "difficulty", "max_steps"}
+    missing = required_task_keys.difference(tasks[0].keys())
+    if missing:
+        errors.append(f"/tasks first entry missing keys: {sorted(missing)}")
+
+if not isinstance(metadata, dict):
+    errors.append("/metadata must return a JSON object")
+else:
+    for key in ("name", "version", "tasks"):
+        if key not in metadata:
+            errors.append(f"/metadata missing key: {key}")
+
+if not isinstance(schema, dict):
+    errors.append("/schema must return a JSON object")
+else:
+    for key in ("action", "observation", "state"):
+        if key not in schema:
+            errors.append(f"/schema missing key: {key}")
+
+if errors:
+    print("[FAIL] API discovery validation failed:", file=sys.stderr)
+    for err in errors:
+        print(f"  - {err}", file=sys.stderr)
+    raise SystemExit(1)
+
+print("[PASS] API discovery endpoints are valid")
+PY
+  then
+    exit 1
+  fi
+else
+  echo "[INFO] Skipping API discovery endpoint checks"
+fi
+
+case "${CHECK_MCP}" in
+  true)
+    echo "[INFO] Probing MCP initialize endpoint"
+    if ! probe_mcp_initialize; then
+      echo "[FAIL] MCP initialize probe failed"
+      exit 1
+    fi
+    ;;
+  auto)
+    echo "[INFO] Probing MCP initialize endpoint (auto)"
+    if ! probe_mcp_initialize; then
+      echo "[INFO] Skipping MCP probe result in auto mode"
+    fi
+    ;;
+  false)
+    echo "[INFO] Skipping MCP probe"
+    ;;
+  *)
+    echo "[FAIL] Invalid CHECK_MCP value: ${CHECK_MCP}"
+    exit 1
+    ;;
+esac
 
 echo "[INFO] Running inference for tasks: ${TASKS[*]}"
 inference_log="$(mktemp)"

@@ -94,8 +94,12 @@ python -m cloudscalerl.client task1_hpa task2_cost task3_incident
 
 ```bash
 export API_BASE_URL="http://localhost:8000"
+export ENV_URL="http://localhost:8000"
 export MODEL_NAME="gpt-4o"
 export HF_TOKEN="<token>"
+export SEED=42
+export INFERENCE_TEMPERATURE=0.0
+export ENABLE_LLM_PROBE=false
 python inference.py
 ```
 
@@ -104,6 +108,18 @@ python inference.py
 - `[START] task=<task_name> env=<benchmark> model=<model_name>`
 - `[STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>`
 - `[END] success=<true|false> steps=<n> rewards=<r1,r2,...,rn>`
+
+### Evaluator endpoint checks
+
+```bash
+curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/tasks
+curl -fsS http://localhost:8000/metadata
+curl -fsS http://localhost:8000/schema
+curl -fsS -X POST http://localhost:8000/mcp \
+	-H "Content-Type: application/json" \
+	-d '{"jsonrpc":"2.0","method":"initialize","params":{},"id":1}'
+```
 
 ### Docker usage
 
