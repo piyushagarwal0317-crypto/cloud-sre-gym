@@ -295,7 +295,7 @@ class CloudScaleHTTPEndpoint:
     """
     Thin HTTP client for the current FastAPI app contract.
 
-    The local app exposes REST endpoints (/reset, /step, /state) rather than
+    The local app exposes REST endpoints (/reset, /step, /state, /grade) rather than
     openenv websocket endpoints, so run_episode uses this adapter.
     """
 
@@ -351,6 +351,19 @@ class CloudScaleHTTPEndpoint:
             reward=data.get("reward"),
             done=bool(data.get("done", False)),
         )
+
+    def grade(self) -> Optional[float]:
+        """Fetch current deterministic task score from server-side task grader."""
+        try:
+            response = self._client.get("/grade")
+            response.raise_for_status()
+            payload = response.json()
+            score = payload.get("score")
+            if score is None:
+                return None
+            return float(score)
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None
 
 
 # ── Main Agent Loop ───────────────────────────────────────────────────────────
@@ -738,6 +751,8 @@ def run_episode(
                     }
                 )
 
+        task_score = env.grade()
+
     mean_reward = total_reward / max(len(reward_history), 1)
     if emit_console:
         console.print(Panel(
@@ -748,6 +763,7 @@ def run_episode(
         ))
     return {
         "task_id": task_id,
+        "task_score": task_score,
         "total_reward": total_reward,
         "mean_reward": mean_reward,
         "ticks": len(reward_history),

@@ -25,7 +25,7 @@ import random
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     from openenv.core.env_server import EnvServer
@@ -184,6 +184,10 @@ class CloudScaleEnvServer(EnvServer):
         self._pending_nodes: list[_PendingNode] = []
         self._trace: list[float] = []
         self._metrics_cache: dict[str, ServiceMetrics] = {}
+        self._trajectory: list[CloudScaleObservation] = []
+        self._task_grader: Optional[Callable[[list[CloudScaleObservation]], float]] = None
+        self._final_task_score: Optional[float] = None
+        self._grader_error: Optional[str] = None
 
     # ── openenv EnvServer interface ───────────────────────────────────────────
 
@@ -199,14 +203,26 @@ class CloudScaleEnvServer(EnvServer):
         Called by EnvServer when POST /reset is received.
         Mirrors DMControlEnv.reset() signature pattern.
         """
-        from cloudscalerl.tasks.Task1hpa import TASK_CONFIG as TASK1_CONFIG
-        from cloudscalerl.tasks.Task2cost import TASK_CONFIG as TASK2_CONFIG
-        from cloudscalerl.tasks.Task3incident import TASK_CONFIG as TASK3_CONFIG
+        from cloudscalerl.tasks.Task1hpa import (
+            TASK_CONFIG as TASK1_CONFIG,
+            grade_task1,
+        )
+        from cloudscalerl.tasks.Task2cost import (
+            TASK_CONFIG as TASK2_CONFIG,
+            grade_task2,
+        )
+        from cloudscalerl.tasks.Task3incident import (
+            TASK_CONFIG as TASK3_CONFIG,
+            grade_task3,
+        )
 
-        task_map = {
-            "task1_hpa": TASK1_CONFIG,
-            "task2_cost": TASK2_CONFIG,
-            "task3_incident": TASK3_CONFIG,
+        task_map: dict[
+            str,
+            tuple[dict[str, Any], Callable[[list[CloudScaleObservation]], float]],
+        ] = {
+            "task1_hpa": (TASK1_CONFIG, grade_task1),
+            "task2_cost": (TASK2_CONFIG, grade_task2),
+            "task3_incident": (TASK3_CONFIG, grade_task3),
         }
         if task_id not in task_map:
             raise ValueError(
@@ -214,7 +230,7 @@ class CloudScaleEnvServer(EnvServer):
                 f"Valid options: {list(task_map.keys())}"
             )
 
-        self._task_config = task_map[task_id]
+        self._task_config, self._task_grader = task_map[task_id]
         self._seed = seed
         self._rng = random.Random(seed)
         self._step_count = 0
@@ -227,11 +243,16 @@ class CloudScaleEnvServer(EnvServer):
         self._pending_scale = []
         self._pending_nodes = []
         self._metrics_cache = {}
+        self._trajectory = []
+        self._final_task_score = None
+        self._grader_error = None
 
         self._load_trace()
         self._init_cluster()
 
-        return self._build_observation(render=render)
+        initial_observation = self._build_observation(render=render)
+        self._trajectory.append(self._snapshot_observation(initial_observation))
+        return initial_observation
 
     def _step(
         self,
@@ -295,6 +316,11 @@ class CloudScaleEnvServer(EnvServer):
         )
 
         obs = self._build_observation(render=render)
+        self._trajectory.append(self._snapshot_observation(obs))
+
+        final_task_score: Optional[float] = None
+        if done:
+            final_task_score = self._compute_task_score()
 
         reward_detail = CloudScaleReward(
             total=total_reward,
@@ -310,7 +336,28 @@ class CloudScaleEnvServer(EnvServer):
             "reward_detail": reward_detail.model_dump(),
             "done": done,
         }
+        if final_task_score is not None:
+            info["final_task_score"] = final_task_score
+        if self._grader_error is not None:
+            info["grader_error"] = self._grader_error
         return obs, total_reward, done, info
+
+    def grade_current_episode(self) -> dict[str, Any]:
+        """
+        Return a deterministic task score for the currently collected trajectory.
+
+        Score is clipped to [0.0, 1.0]. This can be called before or after done.
+        """
+        score = self._compute_task_score()
+        report: dict[str, Any] = {
+            "task_id": self._task_config.get("id", ""),
+            "score": score,
+            "steps": self._step_count,
+            "trajectory_length": len(self._trajectory),
+        }
+        if self._grader_error is not None:
+            report["grader_error"] = self._grader_error
+        return report
 
     def _get_state(self) -> CloudScaleState:
         """
@@ -664,6 +711,25 @@ class CloudScaleEnvServer(EnvServer):
             bd[f"{name}_p99"] = m.p99_latency_ms
             bd[f"{name}_err"] = m.error_rate
         return bd
+
+    def _snapshot_observation(self, obs: CloudScaleObservation) -> CloudScaleObservation:
+        # Keep trajectory compact and deterministic for task graders.
+        return obs.model_copy(update={"dashboard_json": None}, deep=True)
+
+    def _compute_task_score(self) -> Optional[float]:
+        if self._task_grader is None:
+            return None
+
+        try:
+            raw_score = float(self._task_grader(self._trajectory))
+            clipped = max(0.0, min(1.0, raw_score))
+            self._final_task_score = clipped
+            self._grader_error = None
+            return clipped
+        except Exception as exc:
+            self._grader_error = str(exc)
+            self._final_task_score = None
+            return None
 
     def _current_cost_per_hour(self) -> float:
         return sum(r.cost_per_hour for r in self._regions.values())

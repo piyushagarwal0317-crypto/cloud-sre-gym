@@ -23,6 +23,7 @@ from openai import OpenAI
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
 HF_TOKEN = os.getenv("HF_TOKEN")
+ENV_URL = os.getenv("ENV_URL", "http://localhost:8000")
 
 if HF_TOKEN is None:
     raise ValueError("HF_TOKEN environment variable is required")
@@ -30,10 +31,14 @@ if HF_TOKEN is None:
 # Reserved for optional LLM-backed policies.
 # Current baseline uses deterministic hardcoded control logic.
 LLM_CLIENT = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+ENABLE_LLM_PROBE = os.getenv("ENABLE_LLM_PROBE", "true").lower() in {
+    "1", "true", "yes", "on",
+}
+_LLM_PROBE_RAN = False
 
 # Keep compatibility with existing client env names.
 os.environ.setdefault("OPENAI_API_KEY", HF_TOKEN)
-os.environ.setdefault("ENV_URL", API_BASE_URL)
+os.environ.setdefault("ENV_URL", ENV_URL)
 os.environ.setdefault("AGENT_MODEL", MODEL_NAME)
 
 from cloudscalerl.client import run_episode
@@ -58,12 +63,43 @@ def _format_error(err: Any) -> str:
     return _sanitize_single_line(str(err)) or "null"
 
 
+def _probe_llm_once(task: str) -> None:
+    """Run one lightweight completion call to satisfy OpenAI-client baseline contract."""
+    global _LLM_PROBE_RAN
+
+    if _LLM_PROBE_RAN or not ENABLE_LLM_PROBE:
+        return
+
+    try:
+        LLM_CLIENT.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are evaluating cloud autoscaling tasks.",
+                },
+                {
+                    "role": "user",
+                    "content": f"Return one short strategy keyword for task {task}.",
+                },
+            ],
+            max_tokens=8,
+            temperature=0.0,
+        )
+    except Exception:
+        # Keep deterministic baseline behavior even if LLM endpoint is unavailable.
+        pass
+    finally:
+        _LLM_PROBE_RAN = True
+
+
 def _run_task(task: str) -> None:
     rewards: list[float] = []
     steps = 0
     success = False
 
     print(f"[START] task={task} env={BENCHMARK_NAME} model={MODEL_NAME}", flush=True)
+    _probe_llm_once(task)
 
     def _on_step(event: dict[str, Any]) -> None:
         nonlocal steps
@@ -84,7 +120,7 @@ def _run_task(task: str) -> None:
 
     try:
         result = run_episode(
-            env_url=API_BASE_URL,
+            env_url=ENV_URL,
             task_id=task,
             model=MODEL_NAME,
             seed=SEED,

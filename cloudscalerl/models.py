@@ -13,17 +13,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
     from openenv.core.env_server.types import Action, Observation, State
 except ImportError:
     # Fallback: plain Pydantic BaseModel so the file works standalone
-    from pydantic import BaseModel as _Base
-
-    Action = _Base        # type: ignore[assignment,misc]
-    Observation = _Base   # type: ignore[assignment,misc]
-    State = _Base         # type: ignore[assignment,misc]
+    Action = BaseModel        # type: ignore[assignment,misc]
+    Observation = BaseModel   # type: ignore[assignment,misc]
+    State = BaseModel         # type: ignore[assignment,misc]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,7 +29,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class ServiceMetrics(Action):
+class ServiceMetrics(BaseModel):
     """
     Per-service metrics snapshot at one tick.
     Nested inside CloudScaleObservation.observations["<service_name>"].
@@ -51,7 +49,7 @@ class ServiceMetrics(Action):
     )
 
 
-class RegionState(Action):
+class RegionState(BaseModel):
     """
     Per-region cluster state snapshot.
     Nested inside CloudScaleObservation.regions["<region_id>"].
@@ -331,7 +329,7 @@ class CloudScaleState(State):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class CloudScaleReward(Action):  # plain BaseModel stand-in
+class CloudScaleReward(BaseModel):
     """
     Detailed reward breakdown returned alongside each step.
     total is the scalar clipped to [-1.0, 1.0] that RL algorithms consume.
